@@ -9,13 +9,13 @@ Panel {
   id: root
   moduleName: "mbo.optimize"
   ipcTarget: "mbo.optimize"
-  manageIpc: true
+  manageIpc: false
 
   // ----- theme (lifted off the host bar when present) ---------------------
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property color urgent: bar ? bar.urgent : Color.urgent
-  readonly property color good: Color.success || "green"
+  readonly property color good: Color.accent
   readonly property color surface: Color.popups.background
   readonly property color track: Style.selectedFillFor(foreground, Color.accent)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
@@ -71,27 +71,31 @@ Panel {
     if (ids.length === 0) return
     var marked = {}; for (var i = 0; i < ids.length; i++) marked[ids[i]] = "running"
     applied = marked
-    applyProc.args = ["apply", JSON.stringify(Object.keys(selected))]
+    applyProc.command = ["omarchy-optimize-apply", "apply", JSON.stringify(ids)]
     applyProc.running = true
   }
 
   function dismiss(id) {
-    dismissProc.args = ["dismiss", id]
+    dismissProc.command = ["omarchy-optimize-state", "dismiss", id]
     dismissProc.running = true
   }
 
   // ----- IPC surface (omarchy-shell mbo.optimize <open|scan|apply|...>) --
   IpcHandler {
-    target: "mbo.optimize.scan"
+    target: "mbo.optimize"
+
+    function open(): string { root.open(); return "ok" }
+    function close(): string { root.close(); return "ok" }
+    function toggle(): string { root.toggle(); return "ok" }
     function scan(): string { root.scanNow(); return "ok" }
-  }
-  IpcHandler {
-    target: "mbo.optimize.apply"
     function apply(): string { root.applySelected(); return "ok" }
-    function applyIds(ids): string {
+    function applyIds(idsJson: string): string {
+      var ids = JSON.parse(idsJson)
       var marked = {}; for (var i = 0; i < ids.length; i++) marked[ids[i]] = true
       selected = marked; root.applySelected(); return "ok"
     }
+    function refresh(): string { root.refreshState(); root.refreshRecs(); return "ok" }
+    function dismiss(id: string): string { root.dismiss(id); return "ok" }
   }
 
   // ----- bar button -------------------------------------------------------
@@ -191,7 +195,6 @@ Panel {
             Button {
               text: "Execute (" + Object.keys(selected).length + ")"
               enabled: Object.keys(selected).length > 0 && !scanning
-              highlighted: true
               onClicked: root.applySelected()
             }
           }
@@ -219,6 +222,7 @@ Panel {
           Repeater {
             model: root.recommendations
             delegate: Rectangle {
+              id: card
               width: panelFlick.width
               height: row.implicitHeight + Style.space(16)
               color: root.surface
@@ -236,7 +240,7 @@ Panel {
                 Row {
                     width: parent.width
                     spacing: Style.space(8)
-                    CheckBox { checked: parent.parent.checked; onToggled: root.toggleSelected(rec.id); enabled: appliedStatus === "" }
+                    CheckBox { checked: card.checked; onToggled: root.toggleSelected(rec.id); enabled: appliedStatus === "" }
                     Text {
                         width: parent.width - 40
                         text: rec.title || rec.id
@@ -289,7 +293,7 @@ Panel {
                   width: parent.width
                   text: rec.command
                   color: root.dim
-                  font.family: Style.font.mono || root.fontFamily
+                  font.family: Style.font.family
                   font.pixelSize: Style.font.caption
                   wrapMode: Text.Wrap
                   elide: Text.ElideRight
@@ -323,18 +327,18 @@ Panel {
   Process {
     id: stateProc
     command: ["omarchy-optimize-state", "read"]
-    onExited: function(exitCode) {
-      if (exitCode === 0 && stdout.length > 0) {
-        try { state = JSON.parse(stdout.join("")) } catch (e) {}
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try { root.state = JSON.parse(text) } catch (e) {}
       }
     }
   }
   Process {
     id: recsProc
     command: ["omarchy-optimize-state", "recommendations"]
-    onExited: function(exitCode) {
-      if (exitCode === 0 && stdout.length > 0) {
-        try { recommendations = JSON.parse(stdout.join("")) } catch (e) { recommendations = [] }
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try { root.recommendations = JSON.parse(text) } catch (e) { root.recommendations = [] }
       }
     }
   }
@@ -345,29 +349,28 @@ Panel {
       scanning = false
       root.refreshState()
       root.refreshRecs()
-      if (exitCode !== 0) state = Object.assign({}, state, { status: "error" })
+      if (exitCode !== 0) root.state = Object.assign({}, root.state, { status: "error" })
     }
   }
   Process {
     id: applyProc
     command: ["omarchy-optimize-apply"]
-    args: []
-    onExited: function(exitCode) {
-      var out = stdout.join("")
-      try {
-        var result = JSON.parse(out || "{}")
-        var next = Object.assign({}, applied)
-        for (var id in result) next[id] = result[id]
-        applied = next
-      } catch (e) {}
-      root.refreshState()
-      root.refreshRecs()
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try {
+          var result = JSON.parse(text || "{}")
+          var next = Object.assign({}, root.applied)
+          for (var id in result) next[id] = result[id]
+          root.applied = next
+        } catch (e) {}
+        root.refreshState()
+        root.refreshRecs()
+      }
     }
   }
   Process {
     id: dismissProc
     command: ["omarchy-optimize-state"]
-    args: []
     onExited: function() { root.refreshState(); root.refreshRecs() }
   }
 

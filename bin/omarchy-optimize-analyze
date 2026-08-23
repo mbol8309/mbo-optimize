@@ -13,7 +13,7 @@ set -euo pipefail
 
 STATE_DIR="${OMARCHY_OPTIMIZE_STATE_DIR:-$HOME/.local/state/omarchy/optimize}"
 mkdir -p "$STATE_DIR"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 PROMPT_TEMPLATE="$SCRIPT_DIR/../prompts/analyze.md"
 SNAPSHOT="$STATE_DIR/snapshot.json"
 RECS_OUT="$STATE_DIR/recommendations.json"
@@ -78,17 +78,64 @@ if [[ ! -f "$PROMPT_TEMPLATE" ]]; then
 fi
 
 SNAPSHOT_JSON="$(cat "$SNAPSHOT")"
-PROMPT="$(sed "s|__SNAPSHOT__|$SNAPSHOT_JSON|" "$PROMPT_TEMPLATE")"
+PROMPT_FILE="$(mktemp)"
+trap 'rm -f "$RAW" "$RAW.json" "$PROMPT_FILE"' EXIT
+python3 - "$PROMPT_TEMPLATE" "$SNAPSHOT_JSON" "$PROMPT_FILE" <<'PY'
+import sys
+template, snapshot, out = sys.argv[1], sys.argv[2], sys.argv[3]
+text = open(template).read().replace("__SNAPSHOT__", snapshot)
+open(out, "w").write(text)
+PY
+PROMPT="$(cat "$PROMPT_FILE")"
 
-# 3. Call the agent inline. `omarchy agent prompt` always uses the configured
-# default agent; to analyze with a specific one, run
-# `omarchy default agent <name>` before triggering a scan. The AGENT variable
-# here is only informational (written into the prompt).
-AGENT_ARGS=("omarchy" "agent" "prompt" "--inline" "$PROMPT")
+# 3. Call the agent headlessly. `omarchy agent prompt` always launches an
+# interactive TUI that never exits, so it cannot be used here. Instead we map
+# the configured agent to its own non-interactive mode and extract the assistant
+# text from stdout. Supported: opencode (default), claude, codex. Unknown
+# agents fall back to `omarchy agent prompt --inline` with a warning (may hang
+# if that agent has no headless exit).
+resolve_agent() {
+  local a="$1"
+  if [[ "$a" == "default" ]]; then a="$(omarchy-default-agent 2>/dev/null || true)"; fi
+  echo "$a"
+}
+
+run_agent_headless() {
+  # $1 = prompt. Prints assistant text to stdout.
+  local prompt="$1"
+  local a; a="$(resolve_agent "$AGENT")"
+  case "$a" in
+    opencode|"")
+      opencode run --format json "$prompt" 2>/dev/null | python3 -c '
+import json, sys
+out = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: ev = json.loads(line)
+    except: continue
+    if ev.get("type") == "text":
+        p = ev.get("part") or {}
+        if p.get("type") == "text" and "text" in p: out.append(p["text"])
+print("".join(out))
+'
+      ;;
+    claude)
+      claude -p "$prompt" --output-format text 2>/dev/null
+      ;;
+    codex)
+      codex exec "$prompt" 2>/dev/null
+      ;;
+    *)
+      echo "omarchy-optimize-analyze: no headless mode for agent '$a'; falling back to omarchy agent prompt --inline (may hang)" >&2
+      omarchy agent prompt --inline "$prompt" 2>/dev/null
+      ;;
+  esac
+}
 
 RAW="$(mktemp)"
-trap 'rm -f "$RAW" "$RAW.json"' EXIT
-if ! "${AGENT_ARGS[@]}" > "$RAW" 2>&1; then
+trap 'rm -f "$RAW" "$PROMPT_FILE"' EXIT
+if ! run_agent_headless "$PROMPT" > "$RAW" 2>&1; then
   echo "agent call failed:" >&2
   cat "$RAW" >&2
   write_state "error" 0
