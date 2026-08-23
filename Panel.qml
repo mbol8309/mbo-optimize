@@ -27,8 +27,9 @@ Panel {
   property var state: ({})
   property var recommendations: []
   property var selected: ({})        // id -> true
+  property int selectedCount: 0
   property bool scanning: false
-  property var applied: ({})         // id -> status (running|ok|failed)
+  property var applied: ({})         // id -> status (running|ok|failed|partial|skipped)
 
   readonly property string status: state.status || "idle"      // idle|scanning|optimized|pending|error
   readonly property int pendingCount: state.pending_count || 0
@@ -58,17 +59,19 @@ Panel {
     var next = Object.assign({}, selected)
     if (next[id]) delete next[id]; else next[id] = true
     selected = next
+    selectedCount = Object.keys(next).length
   }
   function selectAll() {
     var next = {}; for (var i = 0; i < recommendations.length; i++) next[recommendations[i].id] = true
     selected = next
+    selectedCount = Object.keys(next).length
   }
-  function selectNone() { selected = ({}) }
+  function selectNone() { selected = ({}); selectedCount = 0 }
   function clearApplied() { applied = ({}) }
 
   function applySelected() {
+    if (selectedCount === 0) return
     var ids = Object.keys(selected)
-    if (ids.length === 0) return
     var marked = {}; for (var i = 0; i < ids.length; i++) marked[ids[i]] = "running"
     applied = marked
     applyProc.command = ["omarchy-optimize-apply", "apply", JSON.stringify(ids)]
@@ -191,10 +194,10 @@ Panel {
             spacing: Style.space(8)
             Button { text: "Scan now";     enabled: !scanning; onClicked: root.scanNow() }
             Button { text: "Select all";   enabled: recommendations.length > 0; onClicked: root.selectAll() }
-            Button { text: "Clear";        enabled: Object.keys(selected).length > 0; onClicked: root.selectNone() }
+            Button { text: "Clear";        enabled: selectedCount > 0; onClicked: root.selectNone() }
             Button {
-              text: "Execute (" + Object.keys(selected).length + ")"
-              enabled: Object.keys(selected).length > 0 && !scanning
+              text: "Execute (" + selectedCount + ")"
+              enabled: selectedCount > 0 && !scanning
               onClicked: root.applySelected()
             }
           }
@@ -307,11 +310,13 @@ Panel {
               }
               MouseArea {
                 anchors.fill: parent
-                acceptedButtons: Qt.RightButton
+                acceptedButtons: Qt.LeftButton | Qt.RightButton
                 onClicked: function(mouse) {
-                  root.dismiss(rec.id)
+                  if (mouse.button === Qt.RightButton) root.dismiss(rec.id)
+                  else root.toggleSelected(rec.id)
                   mouse.accepted = true
                 }
+                onPressed: function(mouse) { mouse.accepted = true }
               }
             }
           }
