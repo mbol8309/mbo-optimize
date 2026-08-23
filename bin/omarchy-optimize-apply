@@ -51,13 +51,20 @@ PY
 
 run_sudo_in_terminal() {
   # Launch a floating terminal with the command so the user can type sudo
-  # password and see output. The presentation waits for a keypress.
+  # password and see output. The presentation waits for a keypress, so this
+  # blocks until the user is done — the panel stays "running" until then.
   local cmd="$1"
   if command -v "$FLOATING_TERMINAL" >/dev/null 2>&1; then
-    $FLOATING_TERMINAL "$cmd; omarchy show done" >/dev/null 2>&1 || true
+    $FLOATING_TERMINAL "$cmd; omarchy show done" 2>/dev/null
+    local ec=$?
+    if [[ $ec -eq 0 ]]; then
+      return 0
+    else
+      return 1
+    fi
   else
-    # Fallback: try to run via pkexec if no terminal launcher is available.
-    pkexec bash -c "$cmd" >/dev/null 2>&1 || true
+    pkexec bash -c "$cmd" 2>/dev/null
+    return $?
   fi
 }
 
