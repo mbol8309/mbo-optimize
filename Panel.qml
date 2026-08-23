@@ -240,7 +240,13 @@ Panel {
                 Row {
                     width: parent.width
                     spacing: Style.space(8)
-                    CheckBox { checked: card.checked; onToggled: root.toggleSelected(rec.id); enabled: appliedStatus === "" }
+                    CheckBox {
+                      id: cb
+                      checked: card.checked
+                      onToggled: root.toggleSelected(rec.id)
+                      enabled: appliedStatus === ""
+                      z: 2  // stay above the card MouseArea
+                    }
                     Text {
                         width: parent.width - 40
                         text: rec.title || rec.id
@@ -302,8 +308,11 @@ Panel {
               MouseArea {
                 anchors.fill: parent
                 acceptedButtons: Qt.LeftButton | Qt.RightButton
+                propagateComposedEvents: true
                 onClicked: function(mouse) {
                   if (mouse.button === Qt.RightButton) root.dismiss(rec.id)
+                  else root.toggleSelected(rec.id)
+                  mouse.accepted = false
                 }
               }
             }
