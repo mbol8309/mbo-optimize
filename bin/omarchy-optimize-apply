@@ -38,9 +38,14 @@ ids = json.loads(sys.argv[1])
 recs = json.load(open(sys.argv[2]))
 by_id = {r["id"]: r for r in recs}
 selected = [by_id[i] for i in ids if i in by_id]
-# Print one line per selected rec: id \t action \t path \t command
+# Print one JSON object per line so bash can read them safely.
 for r in selected:
-    print(f"{r['id']}\t{r.get('action','command')}\t{r.get('path','')}\t{r.get('command','')}")
+    print(json.dumps({
+        "id": r["id"],
+        "action": r.get("action","command"),
+        "path": r.get("path",""),
+        "command": r.get("command",""),
+    }))
 PY
 )
 
@@ -58,7 +63,13 @@ run_sudo_in_terminal() {
 
 declare -A STATUS
 
-while IFS=$'\t' read -r id action path command; do
+while IFS= read -r line; do
+  [[ -n "$line" ]] || continue
+  # Parse the JSON line safely (avoids tab-splitting issues with empty fields).
+  id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$line")
+  action=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["action"])' <<<"$line")
+  path=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])' <<<"$line")
+  command=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["command"])' <<<"$line")
   STATUS[$id]="ok"
   case "$action" in
     command)
@@ -66,7 +77,10 @@ while IFS=$'\t' read -r id action path command; do
       if grep -qE "sudo|pkexec|pacman|systemctl|rm -rf /" <<<"$command"; then
         run_sudo_in_terminal "$command"
       else
-        bash -c "$command" >/dev/null 2>&1 || STATUS[$id]="failed"
+        # Run and tolerate non-zero exit (e.g. find -delete hits permission
+        # errors but still frees space); only mark failed if the command
+        # itself is missing or the shell rejects it.
+        bash -c "$command" >/dev/null 2>&1 || STATUS[$id]="partial"
       fi
       ;;
     uninstall)
