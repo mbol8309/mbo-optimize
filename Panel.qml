@@ -130,6 +130,9 @@ Panel {
   }
 
   // ----- bar button --------------------------------------------------------
+  // Icon only appears when there is something to say (pending recs or
+  // scanning), so an already-optimized machine stays quiet. The tooltip
+  // carries the at-a-glance status the user hovers for.
   visible: alarming || scanning
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -139,6 +142,7 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: scanning ? "\uf110" : "\uf0e4"
+    visible: true
     active: root.alarming
     slotSize: Style.bar.statusSlot
     fontSize: Style.font.caption
@@ -589,7 +593,14 @@ Panel {
     command: ["omarchy-optimize-state", "read"]
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: { try { root.state = JSON.parse(text) } catch (e) {} }
+      onStreamFinished: {
+        try {
+          root.state = JSON.parse(text)
+          console.debug("mbo.optimize state loaded:", JSON.stringify(root.state))
+        } catch (e) {
+          console.warn("mbo.optimize state parse error:", text, e)
+        }
+      }
     }
   }
   Process {
@@ -648,7 +659,9 @@ Panel {
   }
 
   // ----- refresh cadence ---------------------------------------------------
-  Timer { interval: 30000; running: root.opened; repeat: true; triggeredOnStart: true; onTriggered: { root.refreshState(); root.refreshRecs() } }
-  Timer { interval: 60000; running: true; repeat: true; triggeredOnStart: true; onTriggered: root.refreshState() }
+  // A timer with running:true fires on instantiation regardless of visible,
+  // so the widget discovers pending recommendations even while hidden and
+  // flips visible on when there is something to show.
+  Timer { interval: 30000; running: true; repeat: true; triggeredOnStart: true; onTriggered: { root.refreshState(); root.refreshRecs() } }
   Component.onCompleted: { root.refreshState(); root.refreshRecs() }
 }

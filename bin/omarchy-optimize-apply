@@ -50,18 +50,10 @@ PY
 )
 
 run_sudo_in_terminal() {
-  # Launch a floating terminal with the command so the user can type sudo
-  # password and see output. The presentation waits for a keypress, so this
-  # blocks until the user is done — the panel stays "running" until then.
   local cmd="$1"
   if command -v "$FLOATING_TERMINAL" >/dev/null 2>&1; then
     $FLOATING_TERMINAL "$cmd; omarchy show done" 2>/dev/null
-    local ec=$?
-    if [[ $ec -eq 0 ]]; then
-      return 0
-    else
-      return 1
-    fi
+    return $?
   else
     pkexec bash -c "$cmd" 2>/dev/null
     return $?
@@ -70,6 +62,27 @@ run_sudo_in_terminal() {
 
 declare -A STATUS
 
+# Verify that packages are actually uninstalled. Sets STATUS[$id] based on
+# how many packages still appear installed.
+verify_uninstall() {
+  local pkgs="$1"
+  local still_installed=0
+  local total=0
+  for pkg in $pkgs; do
+    total=$((total + 1))
+    if pacman -Qi "$pkg" >/dev/null 2>&1; then
+      still_installed=$((still_installed + 1))
+    fi
+  done
+  if [[ $still_installed -eq 0 ]]; then
+    : # keep STATUS=ok
+  elif [[ $still_installed -eq $total ]]; then
+    STATUS[$id]="failed"
+  else
+    STATUS[$id]="partial"
+  fi
+}
+
 while IFS= read -r line; do
   [[ -n "$line" ]] || continue
   # Parse the JSON line safely (avoids tab-splitting issues with empty fields).
@@ -77,25 +90,34 @@ while IFS= read -r line; do
   action=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["action"])' <<<"$line")
   path=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])' <<<"$line")
   command=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["command"])' <<<"$line")
+  verify=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("verify",""))' <<<"$line")
   STATUS[$id]="ok"
   case "$action" in
     command)
       [[ -n "$command" ]] || { STATUS[$id]="skipped"; continue; }
       if grep -qE "sudo|pkexec|pacman|systemctl|rm -rf /" <<<"$command"; then
         run_sudo_in_terminal "$command"
+        ec=$?
+        if [[ $ec -ne 0 ]]; then STATUS[$id]="failed"; else STATUS[$id]="ok"; fi
       else
-        # Run and tolerate non-zero exit (e.g. find -delete hits permission
-        # errors but still frees space); only mark failed if the command
-        # itself is missing or the shell rejects it.
-        bash -c "$command" >/dev/null 2>&1 || STATUS[$id]="partial"
+        set +e
+        bash -c "$command" >/dev/null 2>&1
+        ec=$?
+        set -e
+        if [[ $ec -eq 0 ]]; then STATUS[$id]="ok"
+        else STATUS[$id]="partial"; fi
       fi
       ;;
     uninstall)
-      # Expect the package list in `command` as e.g. "rust go nodejs" or a
-      # single name. Pacman -Rns handles the list.
       pkgs="${command:-$path}"
       [[ -n "$pkgs" ]] || { STATUS[$id]="skipped"; continue; }
       run_sudo_in_terminal "sudo pacman -Rns --noconfirm $pkgs"
+      ec=$?
+      if [[ $ec -ne 0 ]]; then
+        STATUS[$id]="failed"
+      else
+        verify_uninstall "$pkgs"
+      fi
       ;;
     delete)
       target="${command:-$path}"
@@ -104,7 +126,11 @@ while IFS= read -r line; do
       if [[ "$target" == "$HOME" || "$target" == "/" ]]; then
         STATUS[$id]="skipped"; continue
       fi
-      rm -rf -- "$target" >/dev/null 2>&1 || STATUS[$id]="failed"
+      set +e
+      rm -rf -- "$target" >/dev/null 2>&1
+      set -e
+      if [[ ! -e "$target" ]]; then STATUS[$id]="ok"
+      else STATUS[$id]="failed"; fi
       ;;
     archive)
       target="${command:-$path}"
@@ -113,8 +139,17 @@ while IFS= read -r line; do
       archive_dir="$HOME/Archive"
       mkdir -p "$archive_dir"
       name="$(basename "$target")"
-      tar -czf "$archive_dir/${name}.tar.gz" -C "$(dirname "$target")" "$name" >/dev/null 2>&1 \
-        && rm -rf -- "$target" >/dev/null 2>&1 || STATUS[$id]="failed"
+      archive_path="$archive_dir/${name}.tar.gz"
+      set +e
+      tar -czf "$archive_path" -C "$(dirname "$target")" "$name" >/dev/null 2>&1
+      set -e
+      if [[ -f "$archive_path" ]] && [[ ! -e "$target" ]]; then
+        STATUS[$id]="ok"
+      elif [[ -f "$archive_path" ]]; then
+        STATUS[$id]="partial"
+      else
+        STATUS[$id]="failed"
+      fi
       ;;
     cloud)
       target="${command:-$path}"
@@ -123,14 +158,25 @@ while IFS= read -r line; do
       case "$CLOUD" in
         rclone)
           command -v rclone >/dev/null 2>&1 || { STATUS[$id]="skipped"; continue; }
-          rclone copy "$target" "omarchy-optimize:$(basename "$target")" >/dev/null 2>&1 \
-            && rm -rf -- "$target" >/dev/null 2>&1 || STATUS[$id]="failed"
+          set +e
+          rclone copy "$target" "omarchy-optimize:$(basename "$target")" >/dev/null 2>&1
+          ec=$?
+          set -e
+          if [[ $ec -eq 0 ]]; then STATUS[$id]="ok"; else STATUS[$id]="failed"; fi
           ;;
         local-send)
-          omarchy share file "$target" >/dev/null 2>&1 || STATUS[$id]="failed"
+          set +e
+          omarchy share file "$target" >/dev/null 2>&1
+          ec=$?
+          set -e
+          if [[ $ec -eq 0 ]]; then STATUS[$id]="ok"; else STATUS[$id]="failed"; fi
           ;;
         tailscale)
-          omarchy tailscale send "$target" >/dev/null 2>&1 || STATUS[$id]="failed"
+          set +e
+          omarchy tailscale send "$target" >/dev/null 2>&1
+          ec=$?
+          set -e
+          if [[ $ec -eq 0 ]]; then STATUS[$id]="ok"; else STATUS[$id]="failed"; fi
           ;;
         *)
           STATUS[$id]="skipped"
@@ -141,6 +187,20 @@ while IFS= read -r line; do
       STATUS[$id]="skipped"
       ;;
   esac
+
+  # If the agent provided a verify command, run it to confirm the action
+  # actually took effect. This overrides the built-in verification.
+  if [[ -n "$verify" && "${STATUS[$id]}" != "skipped" ]]; then
+    set +e
+    bash -c "$verify" >/dev/null 2>&1
+    local vec=$?
+    set -e
+    if [[ $vec -eq 0 ]]; then
+      STATUS[$id]="ok"
+    else
+      [[ "${STATUS[$id]}" == "ok" ]] && STATUS[$id]="failed"
+    fi
+  fi
 done <<<"$RESULT"
 
 # Emit JSON result: {id: "ok"|"failed"|"skipped"}.

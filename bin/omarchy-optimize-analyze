@@ -185,6 +185,7 @@ for r in recs:
         "savings_gb": float(r.get("savings_gb") or 0) if r.get("savings_gb") else 0,
         "action": str(r.get("action","suggest")),
         "command": str(r.get("command","")) if r.get("command") else "",
+        "verify": str(r.get("verify","")) if r.get("verify") else "",
         "path": str(r.get("path","")) if r.get("path") else "",
     })
 json.dump(clean, open(sys.argv[2],"w"), indent=2)

@@ -19,6 +19,7 @@ For each recommendation, produce an object with these fields:
 - `savings_gb`: estimated GB freed (number; 0 if not directly space-related, e.g. uninstall)
 - `action`: one of "command" | "uninstall" | "delete" | "cloud" | "archive" | "suggest"
 - `command` (optional, required for command/uninstall/delete/cloud/archive): the exact shell command to run. For `uninstall`, put the space-separated package names. For `delete`/`archive`/`cloud`, put the path (e.g. ~/Downloads/old.iso). For `command`, put the full command. Leave empty for `suggest`.
+- `verify` (optional): a shell command that returns exit 0 if the action succeeded. E.g. for deleting a file: `test ! -e ~/Downloads/old.iso`. For uninstalling a package: `! pacman -Qi rust >/dev/null 2>&1`. If omitted, the apply script uses built-in verification per action type.
 - `path` (optional): the target path when not redundant with `command`
 
 ### Action semantics (the apply script enforces these)
