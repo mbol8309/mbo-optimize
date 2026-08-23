@@ -588,6 +588,7 @@ Panel {
     id: stateProc
     command: ["omarchy-optimize-state", "read"]
     stdout: StdioCollector {
+      waitForEnd: true
       onStreamFinished: { try { root.state = JSON.parse(text) } catch (e) {} }
     }
   }
@@ -595,6 +596,7 @@ Panel {
     id: recsProc
     command: ["omarchy-optimize-state", "recommendations"]
     stdout: StdioCollector {
+      waitForEnd: true
       onStreamFinished: { try { root.recommendations = JSON.parse(text) } catch (e) { root.recommendations = [] } }
     }
   }
@@ -613,8 +615,13 @@ Panel {
     command: ["omarchy-optimize-apply"]
     stdout: StdioCollector {
       id: applyStdout
+      waitForEnd: true
       property string collected: ""
       onStreamFinished: { collected = text }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (text.trim() !== "") console.warn("mbo.optimize/apply", text.trim())
     }
     onExited: function(exitCode) {
       // Parse the collected stdout (JSON {id: status}).
@@ -623,7 +630,6 @@ Panel {
         var next = {}; for (var id in result) next[id] = result[id]
         root.applied = next
       } catch (e) {
-        // If parse fails, mark all as failed.
         var fail = {}; for (var i = 0; i < root.applyOrder.length; i++) fail[root.applyOrder[i]] = "failed"
         root.applied = fail
       }
@@ -631,7 +637,6 @@ Panel {
       root.applyFinished = true
       root.refreshState()
       root.refreshRecs()
-      // Clear selection — applied items are done.
       root.selected = ({})
       root.selectedCount = 0
     }
