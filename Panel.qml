@@ -307,12 +307,10 @@ Panel {
               }
               MouseArea {
                 anchors.fill: parent
-                acceptedButtons: Qt.LeftButton | Qt.RightButton
-                propagateComposedEvents: true
+                acceptedButtons: Qt.RightButton
                 onClicked: function(mouse) {
-                  if (mouse.button === Qt.RightButton) root.dismiss(rec.id)
-                  else root.toggleSelected(rec.id)
-                  mouse.accepted = false
+                  root.dismiss(rec.id)
+                  mouse.accepted = true
                 }
               }
             }
