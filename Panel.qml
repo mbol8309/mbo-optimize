@@ -28,6 +28,8 @@ Panel {
   property var applied: ({})         // id -> status string
   property var applyOrder: []        // ids in the order they were submitted
   property string viewMode: "list"   // "list" | "results"
+  property int appliedVersion: 0     // bump to force bindings to re-evaluate applied[]
+  property bool applyFinished: false // true when applyProc exits
 
   readonly property string status: state.status || "idle"
   readonly property int pendingCount: state.pending_count || 0
@@ -40,6 +42,8 @@ Panel {
   }
   readonly property bool alarming: status === "pending" && pendingCount > 0
   readonly property int doneCount: {
+    // Depend on appliedVersion so this re-evaluates when applied changes.
+    var _ = appliedVersion
     var n = 0
     for (var id in applied) {
       var s = applied[id]
@@ -47,7 +51,7 @@ Panel {
     }
     return n
   }
-  readonly property bool applyRunning: doneCount < applyOrder.length && applyOrder.length > 0
+  readonly property bool applyRunning: applyOrder.length > 0 && !applyFinished
 
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)) }
 
@@ -81,6 +85,8 @@ Panel {
     applyOrder = ids
     var marked = {}; for (var i = 0; i < ids.length; i++) marked[ids[i]] = "running"
     applied = marked
+    appliedVersion = 0
+    applyFinished = false
     viewMode = "results"
     applyProc.command = ["omarchy-optimize-apply", "apply", JSON.stringify(ids)]
     applyProc.running = true
@@ -90,6 +96,8 @@ Panel {
     viewMode = "list"
     applied = ({})
     applyOrder = []
+    appliedVersion = 0
+    applyFinished = false
   }
 
   function dismiss(id) {
@@ -449,7 +457,8 @@ Panel {
                 radius: Style.space(6)
                 property string rid: modelData
                 property var rec: root.recById(rid)
-                property string st: root.applied[rid] || "pending"
+                // Depend on appliedVersion so this re-evaluates when applied changes.
+                property string st: { var _ = root.appliedVersion; return root.applied[rid] || "pending" }
 
                 Column {
                   id: resultCol
@@ -603,16 +612,28 @@ Panel {
     id: applyProc
     command: ["omarchy-optimize-apply"]
     stdout: StdioCollector {
-      onStreamFinished: {
-        try {
-          var result = JSON.parse(text || "{}")
-          var next = Object.assign({}, root.applied)
-          for (var id in result) next[id] = result[id]
-          root.applied = next
-        } catch (e) {}
-        root.refreshState()
-        root.refreshRecs()
+      id: applyStdout
+      property string collected: ""
+      onStreamFinished: { collected = text }
+    }
+    onExited: function(exitCode) {
+      // Parse the collected stdout (JSON {id: status}).
+      try {
+        var result = JSON.parse(applyStdout.collected || "{}")
+        var next = {}; for (var id in result) next[id] = result[id]
+        root.applied = next
+      } catch (e) {
+        // If parse fails, mark all as failed.
+        var fail = {}; for (var i = 0; i < root.applyOrder.length; i++) fail[root.applyOrder[i]] = "failed"
+        root.applied = fail
       }
+      root.appliedVersion++
+      root.applyFinished = true
+      root.refreshState()
+      root.refreshRecs()
+      // Clear selection — applied items are done.
+      root.selected = ({})
+      root.selectedCount = 0
     }
   }
   Process {
