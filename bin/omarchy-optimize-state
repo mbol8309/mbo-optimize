@@ -15,6 +15,11 @@ STATE_DIR="${OMARCHY_OPTIMIZE_STATE_DIR:-$HOME/.local/state/omarchy/optimize}"
 mkdir -p "$STATE_DIR"
 STATE="$STATE_DIR/state.json"
 RECS="$STATE_DIR/recommendations.json"
+DISMISSED="$STATE_DIR/dismissed.json"
+
+ensure_dismissed() {
+  [[ -f "$DISMISSED" ]] || echo '[]' > "$DISMISSED"
+}
 
 cmd="${1:-read}"
 [[ -z "${2:-}" || "$2" == "" ]] && shift || true
@@ -30,13 +35,22 @@ case "$cmd" in
   dismiss)
     id="${1:-}"
     [[ -n "$id" ]] || { echo "dismiss needs an id" >&2; exit 2; }
+    ensure_dismissed
     if [[ -f "$RECS" ]]; then
-      python3 - "$RECS" "$id" "$STATE" <<'PY'
+      python3 - "$RECS" "$id" "$STATE" "$DISMISSED" <<'PY'
 import json, sys, os, datetime
-recs_path, drop_id, state_path = sys.argv[1], sys.argv[2], sys.argv[3]
+recs_path, drop_id, state_path, dismissed_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+# Remove from current recommendations.
 recs = json.load(open(recs_path))
 recs = [r for r in recs if r.get("id") != drop_id]
 json.dump(recs, open(recs_path, "w"), indent=2)
+# Add to persistent blocklist (dedupe by id).
+try: dismissed = json.load(open(dismissed_path))
+except: dismissed = []
+if not any(d.get("id") == drop_id for d in dismissed):
+  dismissed.append({"id": drop_id, "dismissed_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
+json.dump(dismissed, open(dismissed_path, "w"), indent=2)
+# Update state.
 state = {}
 if os.path.exists(state_path):
     try: state = json.load(open(state_path))
@@ -47,7 +61,25 @@ state["last_scan"] = state.get("last_scan") or datetime.datetime.now(datetime.ti
 json.dump(state, open(state_path, "w"), indent=2)
 PY
     fi
-    echo "dismissed $id"
+    echo "dismissed $id (won't be recommended again)"
+    ;;
+  list-dismissed)
+    ensure_dismissed
+    cat "$DISMISSED"
+    ;;
+  restore)
+    id="${1:-}"
+    [[ -n "$id" ]] || { echo "restore needs an id" >&2; exit 2; }
+    ensure_dismissed
+    python3 - "$DISMISSED" "$id" <<'PY'
+import json, sys
+path, rid = sys.argv[1], sys.argv[2]
+try: dismissed = json.load(open(path))
+except: dismissed = []
+dismissed = [d for d in dismissed if d.get("id") != rid]
+json.dump(dismissed, open(path, "w"), indent=2)
+PY
+    echo "restored $id (will be recommended again on next scan)"
     ;;
   reset)
     echo '{"status":"idle","pending_count":0,"last_scan":""}' > "$STATE"
@@ -70,7 +102,7 @@ json.dump(state, open(path, "w"), indent=2)
 PY
     ;;
   -h|--help|help)
-    echo "Usage: omarchy-optimize-state <read|recommendations|dismiss <id>|reset|write <status> <count>>"
+    echo "Usage: omarchy-optimize-state <read|recommendations|dismiss <id>|list-dismissed|restore <id>|reset|write <status> <count>>"
     ;;
   *)
     echo "unknown subcommand: $cmd" >&2

@@ -142,10 +142,17 @@ if ! run_agent_headless "$PROMPT" > "$RAW" 2>&1; then
   exit 1
 fi
 
-# 4. Extract a JSON object/array from the reply.
-python3 - "$RAW" "$RECS_OUT" <<'PY'
-import json, re, sys
+# 4. Extract a JSON object/array from the reply, then drop dismissed ids.
+DISMISSED="$STATE_DIR/dismissed.json"
+python3 - "$RAW" "$RECS_OUT" "$DISMISSED" <<'PY'
+import json, re, sys, os
 raw = open(sys.argv[1]).read()
+dismissed_path = sys.argv[3]
+# Load persistent blocklist of dismissed ids.
+try:
+    dismissed = {d["id"] for d in json.load(open(dismissed_path)) if isinstance(d, dict) and "id" in d}
+except (FileNotFoundError, json.JSONDecodeError):
+    dismissed = set()
 recs = None
 # Try fenced ```json blocks first.
 for m in re.finditer(r"```(?:json)?\s*(\[.*?\]|\{.*?\})\s*```", raw, re.S):
@@ -164,12 +171,14 @@ if recs is None:
     try: recs = json.loads(raw).get("recommendations", [])
     except: recs = []
 if not isinstance(recs, list): recs = [recs]
-# Sanitize each entry against the schema.
+# Sanitize each entry against the schema, skipping dismissed ids.
 clean = []
 for r in recs:
     if not isinstance(r, dict): continue
+    rid = str(r.get("id") or f"r{len(clean)+1}")
+    if rid in dismissed: continue
     clean.append({
-        "id": str(r.get("id") or f"r{len(clean)+1}"),
+        "id": rid,
         "title": str(r.get("title","")),
         "rationale": str(r.get("rationale","")),
         "severity": str(r.get("severity","low")).lower(),

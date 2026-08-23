@@ -251,12 +251,31 @@ Panel {
                       z: 2  // stay above the card MouseArea
                     }
                     Text {
-                        width: parent.width - 40
+                        width: parent.width - 40 - dismissBtn.implicitWidth - Style.space(8)
                         text: rec.title || rec.id
                         color: root.foreground
                         font.bold: true
                         font.family: root.fontFamily
                         wrapMode: Text.Wrap
+                    }
+                    Text {
+                        id: dismissBtn
+                        text: "\uf00d"
+                        color: root.dim
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: function(mouse) {
+                                root.dismiss(rec.id)
+                                mouse.accepted = true
+                            }
+                            onPressed: function(mouse) { mouse.accepted = true }
+                            hoverEnabled: true
+                            onEntered: parent.color = root.urgent
+                            onExited: parent.color = root.dim
+                        }
                     }
                 }
                 Text {
@@ -328,7 +347,7 @@ Panel {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.Wrap
-            text: "Right-click a card to dismiss it. Cloud/uninstall/delete actions open a terminal to confirm with sudo."
+            text: "Click the ✕ on a card to dismiss it permanently — it won't be recommended again. Right-click also dismisses. Cloud/uninstall/delete actions open a terminal to confirm with sudo."
           }
         }
       }
