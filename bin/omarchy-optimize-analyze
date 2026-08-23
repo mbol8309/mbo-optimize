@@ -1,0 +1,146 @@
+#!/bin/bash
+# omarchy-optimize-analyze — run collector, send snapshot to the default AI
+# coding agent, parse its recommendations, and write recommendations.json +
+# state.json for the panel.
+#
+# The agent is invoked with `omarchy agent prompt --inline` so it returns a
+# plain-text answer we can parse instead of opening a TUI. We instruct it to
+# reply with a single JSON object matching the recommendations schema; if the
+# reply has fenced code we extract the first ```json block, otherwise we try
+# to parse the whole text as JSON and finally fall back to an empty list.
+
+set -euo pipefail
+
+STATE_DIR="${OMARCHY_OPTIMIZE_STATE_DIR:-$HOME/.local/state/omarchy/optimize}"
+mkdir -p "$STATE_DIR"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROMPT_TEMPLATE="$SCRIPT_DIR/../prompts/analyze.md"
+SNAPSHOT="$STATE_DIR/snapshot.json"
+RECS_OUT="$STATE_DIR/recommendations.json"
+STATE_OUT="$STATE_DIR/state.json"
+
+AGENT="${OMARCHY_OPTIMIZE_AGENT:-default}"
+
+usage() {
+  cat <<USAGE
+Usage: omarchy-optimize-analyze [--agent <name>] [--no-collect]
+
+Runs the collector (unless --no-collect), then asks the configured AI agent to
+produce optimization recommendations from the snapshot. Writes
+recommendations.json and state.json into $STATE_DIR.
+
+  --agent <name>   Override the agent for this run (default|claude|codex|...).
+  --no-collect     Skip the collector; reuse the existing snapshot.json.
+
+Agent: $AGENT (set OMARCHY_OPTIMIZE_AGENT or use --agent).
+USAGE
+}
+
+NO_COLLECT=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --agent) AGENT="$2"; shift 2 ;;
+    --no-collect) NO_COLLECT=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+# Update state to "scanning" so the panel reflects the run immediately.
+write_state() {
+  python3 - "$STATE_OUT" "$1" "$2" <<'PY'
+import json, sys, datetime, os
+path,status,count = sys.argv[1], sys.argv[2], int(sys.argv[3])
+state={}
+if os.path.exists(path):
+    try: state=json.load(open(path))
+    except: pass
+state["status"]=status
+state["pending_count"]=count
+state["last_scan"]=datetime.datetime.now(datetime.timezone.utc).isoformat()
+json.dump(state, open(path,"w"), indent=2)
+PY
+}
+
+write_state "scanning" 0
+
+# 1. Collect (unless told to reuse).
+if [[ $NO_COLLECT -eq 0 ]]; then
+  "$SCRIPT_DIR/omarchy-optimize-collect" >/dev/null
+fi
+[[ -f "$SNAPSHOT" ]] || { echo "snapshot missing; run --collect" >&2; write_state "error" 0; exit 1; }
+
+# 2. Build the prompt: template + snapshot.
+if [[ ! -f "$PROMPT_TEMPLATE" ]]; then
+  echo "prompt template missing: $PROMPT_TEMPLATE" >&2
+  write_state "error" 0
+  exit 1
+fi
+
+SNAPSHOT_JSON="$(cat "$SNAPSHOT")"
+PROMPT="$(sed "s|__SNAPSHOT__|$SNAPSHOT_JSON|" "$PROMPT_TEMPLATE")"
+
+# 3. Call the agent inline. `omarchy agent prompt` always uses the configured
+# default agent; to analyze with a specific one, run
+# `omarchy default agent <name>` before triggering a scan. The AGENT variable
+# here is only informational (written into the prompt).
+AGENT_ARGS=("omarchy" "agent" "prompt" "--inline" "$PROMPT")
+
+RAW="$(mktemp)"
+trap 'rm -f "$RAW" "$RAW.json"' EXIT
+if ! "${AGENT_ARGS[@]}" > "$RAW" 2>&1; then
+  echo "agent call failed:" >&2
+  cat "$RAW" >&2
+  write_state "error" 0
+  exit 1
+fi
+
+# 4. Extract a JSON object/array from the reply.
+python3 - "$RAW" "$RECS_OUT" <<'PY'
+import json, re, sys
+raw = open(sys.argv[1]).read()
+recs = None
+# Try fenced ```json blocks first.
+for m in re.finditer(r"```(?:json)?\s*(\[.*?\]|\{.*?\})\s*```", raw, re.S):
+    try:
+        data = json.loads(m.group(1))
+        recs = data if isinstance(data, list) else data.get("recommendations")
+        if recs is not None: break
+    except: pass
+if recs is None:
+    # Try to find the first top-level array in the text.
+    m = re.search(r"\[.*\]", raw, re.S)
+    if m:
+        try: recs = json.loads(m.group(0))
+        except: pass
+if recs is None:
+    try: recs = json.loads(raw).get("recommendations", [])
+    except: recs = []
+if not isinstance(recs, list): recs = [recs]
+# Sanitize each entry against the schema.
+clean = []
+for r in recs:
+    if not isinstance(r, dict): continue
+    clean.append({
+        "id": str(r.get("id") or f"r{len(clean)+1}"),
+        "title": str(r.get("title","")),
+        "rationale": str(r.get("rationale","")),
+        "severity": str(r.get("severity","low")).lower(),
+        "savings_gb": float(r.get("savings_gb") or 0) if r.get("savings_gb") else 0,
+        "action": str(r.get("action","suggest")),
+        "command": str(r.get("command","")) if r.get("command") else "",
+        "path": str(r.get("path","")) if r.get("path") else "",
+    })
+json.dump(clean, open(sys.argv[2],"w"), indent=2)
+print(len(clean))
+PY
+
+# 5. Update state.
+COUNT=$(python3 -c 'import json; print(len(json.load(open("'"$RECS_OUT"'"))))')
+if [[ "$COUNT" -gt 0 ]]; then
+  write_state "pending" "$COUNT"
+else
+  write_state "optimized" 0
+fi
+
+echo "wrote $RECS_OUT ($COUNT recommendations)"

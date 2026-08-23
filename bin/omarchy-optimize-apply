@@ -1,0 +1,135 @@
+#!/bin/bash
+# omarchy-optimize-apply — execute the recommendations the user marked.
+#
+# Args:
+#   apply <json-array-of-ids>   Run each selected recommendation by id.
+#
+# Action handling:
+#   - "command"   : run the command verbatim. If it needs privileges, hand it
+#                  to a floating terminal so the password prompt is visible.
+#   - "uninstall" : pacman -Rns (needs sudo → floating terminal).
+#   - "delete"    : rm -rf the path under $HOME (no sudo for home files).
+#   - "cloud"     : hand off to the configured cloud handler (rclone,
+#                  local-send, tailscale) — see OMARCHY_OPTIMIZE_CLOUD.
+#   - "archive"   : tar the path into ~/Archive and remove the original.
+#
+# Writes a JSON object {id: "ok"|"failed"|"skipped"} to stdout.
+
+set -euo pipefail
+
+STATE_DIR="${OMARCHY_OPTIMIZE_STATE_DIR:-$HOME/.local/state/omarchy/optimize}"
+RECS="$STATE_DIR/recommendations.json"
+CLOUD="${OMARCHY_OPTIMIZE_CLOUD:-none}"
+FLOATING_TERMINAL="omarchy-launch-floating-terminal-with-presentation"
+
+usage() { echo "Usage: $0 apply <json-array-of-ids>"; }
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then usage; exit 0; fi
+[[ ${1:-} == "apply" ]] || { usage >&2; exit 2; }
+shift
+[[ $# -ge 1 ]] || { usage >&2; exit 2; }
+
+IDS_JSON="$1"
+[[ -f "$RECS" ]] || { echo "no recommendations.json" >&2; exit 1; }
+
+RESULT=$(python3 - "$IDS_JSON" "$RECS" <<'PY'
+import json, sys, os
+ids = json.loads(sys.argv[1])
+recs = json.load(open(sys.argv[2]))
+by_id = {r["id"]: r for r in recs}
+selected = [by_id[i] for i in ids if i in by_id]
+# Print one line per selected rec: id \t action \t path \t command
+for r in selected:
+    print(f"{r['id']}\t{r.get('action','command')}\t{r.get('path','')}\t{r.get('command','')}")
+PY
+)
+
+run_sudo_in_terminal() {
+  # Launch a floating terminal with the command so the user can type sudo
+  # password and see output. The presentation waits for a keypress.
+  local cmd="$1"
+  if command -v "$FLOATING_TERMINAL" >/dev/null 2>&1; then
+    $FLOATING_TERMINAL "$cmd; omarchy show done" >/dev/null 2>&1 || true
+  else
+    # Fallback: try to run via pkexec if no terminal launcher is available.
+    pkexec bash -c "$cmd" >/dev/null 2>&1 || true
+  fi
+}
+
+declare -A STATUS
+
+while IFS=$'\t' read -r id action path command; do
+  STATUS[$id]="ok"
+  case "$action" in
+    command)
+      [[ -n "$command" ]] || { STATUS[$id]="skipped"; continue; }
+      if grep -qE "sudo|pkexec|pacman|systemctl|rm -rf /" <<<"$command"; then
+        run_sudo_in_terminal "$command"
+      else
+        bash -c "$command" >/dev/null 2>&1 || STATUS[$id]="failed"
+      fi
+      ;;
+    uninstall)
+      # Expect the package list in `command` as e.g. "rust go nodejs" or a
+      # single name. Pacman -Rns handles the list.
+      pkgs="${command:-$path}"
+      [[ -n "$pkgs" ]] || { STATUS[$id]="skipped"; continue; }
+      run_sudo_in_terminal "sudo pacman -Rns --noconfirm $pkgs"
+      ;;
+    delete)
+      target="${command:-$path}"
+      [[ -n "$target" ]] || { STATUS[$id]="skipped"; continue; }
+      target="${target/#\~/$HOME}"
+      if [[ "$target" == "$HOME" || "$target" == "/" ]]; then
+        STATUS[$id]="skipped"; continue
+      fi
+      rm -rf -- "$target" >/dev/null 2>&1 || STATUS[$id]="failed"
+      ;;
+    archive)
+      target="${command:-$path}"
+      [[ -n "$target" ]] || { STATUS[$id]="skipped"; continue; }
+      target="${target/#\~/$HOME}"
+      archive_dir="$HOME/Archive"
+      mkdir -p "$archive_dir"
+      name="$(basename "$target")"
+      tar -czf "$archive_dir/${name}.tar.gz" -C "$(dirname "$target")" "$name" >/dev/null 2>&1 \
+        && rm -rf -- "$target" >/dev/null 2>&1 || STATUS[$id]="failed"
+      ;;
+    cloud)
+      target="${command:-$path}"
+      [[ -n "$target" ]] || { STATUS[$id]="skipped"; continue; }
+      target="${target/#\~/$HOME}"
+      case "$CLOUD" in
+        rclone)
+          command -v rclone >/dev/null 2>&1 || { STATUS[$id]="skipped"; continue; }
+          rclone copy "$target" "omarchy-optimize:$(basename "$target")" >/dev/null 2>&1 \
+            && rm -rf -- "$target" >/dev/null 2>&1 || STATUS[$id]="failed"
+          ;;
+        local-send)
+          omarchy share file "$target" >/dev/null 2>&1 || STATUS[$id]="failed"
+          ;;
+        tailscale)
+          omarchy tailscale send "$target" >/dev/null 2>&1 || STATUS[$id]="failed"
+          ;;
+        *)
+          STATUS[$id]="skipped"
+          ;;
+      esac
+      ;;
+    suggest|*)
+      STATUS[$id]="skipped"
+      ;;
+  esac
+done <<<"$RESULT"
+
+# Emit JSON result: {id: "ok"|"failed"|"skipped"}.
+{
+  echo -n '{'
+  first=1
+  for id in "${!STATUS[@]}"; do
+    [[ $first -eq 0 ]] && echo -n ','
+    printf '"%s":"%s"' "$id" "${STATUS[$id]}"
+    first=0
+  done
+  echo -n '}'
+} | python3 -m json.tool

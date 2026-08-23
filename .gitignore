@@ -1,0 +1,15 @@
+# build artifacts
+*.pyc
+__pycache__/
+
+# local state is never committed
+state.json
+snapshot.json
+recommendations.json
+selected.json
+
+# editor
+.vscode/
+.idea/
+*.swp
+.DS_Store

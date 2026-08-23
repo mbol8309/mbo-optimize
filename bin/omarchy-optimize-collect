@@ -1,0 +1,175 @@
+#!/bin/bash
+# omarchy-optimize-collect — build snapshot.json for the AI optimizer.
+#
+# Gathers disk usage, hotspots, installed packages with size and last access,
+# journal size, old kernels, docker images, and other space hogs into a single
+# JSON document the analysis agent reads.
+
+set -euo pipefail
+
+STATE_DIR="${OMARCHY_OPTIMIZE_STATE_DIR:-$HOME/.local/state/omarchy/optimize}"
+mkdir -p "$STATE_DIR"
+SNAPSHOT="$STATE_DIR/snapshot.json"
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+
+# --- helpers --------------------------------------------------------------
+json_escape() {
+  # Escape a string for JSON. Reads stdin, writes to stdout.
+  python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().rstrip("\n")))'
+}
+
+# --- disk -----------------------------------------------------------------
+disk_json() {
+  df -h -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null \
+    | awk 'NR>1 && $2 ~ /[GMK]/ {print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6}' \
+    | python3 -c '
+import json, sys
+rows=[]
+for line in sys.stdin:
+  fs,size,used,avail,pct,mount = line.rstrip("\n").split("\t")
+  rows.append({"fs":fs,"size":size,"used":used,"avail":avail,"pct":int(pct.rstrip("%")),"mount":mount})
+print(json.dumps(rows))
+'
+}
+
+# --- hotspots: big dirs under home + Downloads + cache --------------------
+hotspot_json() {
+  python3 - <<'PY'
+import json, os, subprocess, shutil
+home = os.path.expanduser("~")
+candidates = [
+    os.path.join(home, "Downloads"),
+    os.path.join(home, ".cache"),
+    os.path.join(home, "Documents"),
+    os.path.join(home, "Videos"),
+    os.path.join(home, "Games"),
+    os.path.join(home, ".local/share"),
+    os.path.join(home, ".config"),
+    os.path.join(home, ".steam"),
+]
+rows = []
+def du_gb(path):
+    try:
+        out = subprocess.run(["du", "-sb", path], capture_output=True, text=True, timeout=60)
+        return int(out.stdout.split()[0]) / (1024**3) if out.stdout else 0.0
+    except Exception:
+        return 0.0
+for c in candidates:
+    if os.path.isdir(c):
+        gb = du_gb(c)
+        if gb > 0.5:
+            rows.append({"path": "~"+c.replace(home, ""), "gb": round(gb, 2)})
+rows.sort(key=lambda r: r["gb"], reverse=True)
+# Large individual files under Downloads (>250MB)
+big = []
+dl = os.path.join(home, "Downloads")
+if os.path.isdir(dl):
+    for root, _, files in os.walk(dl):
+        for f in files:
+            p = os.path.join(root, f)
+            try:
+                sz = os.path.getsize(p)
+                if sz > 250*1024*1024:
+                    big.append({"path": "~"+p.replace(home, ""), "mb": round(sz/1024**2, 1)})
+            except OSError:
+                pass
+big.sort(key=lambda r: r["mb"], reverse=True)
+big = big[:25]
+print(json.dumps({"dirs": rows, "large_files": big}))
+PY
+}
+
+# --- packages: size + last access (via pacman) ----------------------------
+packages_json() {
+  if ! command -v pacman >/dev/null 2>&1; then
+    echo "[]"
+    return
+  fi
+  pacman -Qi 2>/dev/null \
+    | python3 -c '
+import json, sys, datetime, re
+pkgs=[]
+cur={}
+for line in sys.stdin:
+  line=line.rstrip("\n")
+  if line=="":
+    if cur: pkgs.append(cur)
+    cur={}
+    continue
+  m=re.match(r"^([A-Za-z ]+?)\s*:\s*(.*)$", line)
+  if m:
+    k,v=m.group(1).strip(),m.group(2).strip()
+    if k=="Name": cur["name"]=v
+    elif k=="Installed Size": cur["installed_size"]=v
+    elif k=="Install Date":
+      try: cur["installed_iso"]=datetime.datetime.strptime(v, "%a %d %b %Y %H:%M:%S %Z").date().isoformat()
+      except: pass
+if cur: pkgs.append(cur)
+out=[]
+for p in pkgs:
+  sz=p.get("installed_size","")
+  m=re.match(r"^([\d.]+)\s*(MiB|KiB|GiB)?$", sz)
+  mb=0.0
+  if m:
+    n=float(m.group(1)); unit=(m.group(2) or "MiB")
+    if unit=="KiB": mb=n/1024
+    elif unit=="GiB": mb=n*1024
+    else: mb=n
+  if mb>=50: out.append({"name":p.get("name",""),"mb":round(mb,1),"installed_iso":p.get("installed_iso","")})
+out.sort(key=lambda r:r["mb"], reverse=True)
+print(json.dumps(out[:60]))
+'
+}
+
+# --- journal, kernels, docker -------------------------------------------
+misc_json() {
+  python3 - <<'PY'
+import json, os, subprocess, glob, shutil
+out={"journal_mb":0, "kernels_old":[], "docker_images":[]}
+# journal
+try:
+    r=subprocess.run(["journalctl","--disk-usage"],capture_output=True,text=True)
+    m=__import__("re").search(r"(\d+(?:\.\d+)?)\s*([GMK])?i?B", r.stdout)
+    if m:
+      n=float(m.group(1)); u=(m.group(2) or "M")
+      out["journal_mb"]=round(n*1024 if u=="G" else n/1024 if u=="K" else n,1)
+except Exception: pass
+# old kernels (keep running + one previous)
+try:
+    r=subprocess.run(["uname","-r"],capture_output=True,text=True)
+    running=r.stdout.strip()
+    kdirs=glob.glob("/usr/lib/modules/*/")
+    installed=[os.path.basename(d.rstrip("/")) for d in kdirs]
+    out["kernels_old"]=[k for k in installed if k!=running]
+except Exception: pass
+# docker images
+if shutil.which("docker"):
+    try:
+        r=subprocess.run(["docker","images","--format","{{.Repository}}:{{.Tag}} {{.Size}}"],
+                         capture_output=True,text=True,timeout=15)
+        imgs=[]
+        for line in r.stdout.splitlines():
+            if not line: continue
+            name,size=line.rsplit(" ",1)
+            imgs.append({"name":name,"size":size})
+        out["docker_images"]=imgs[:20]
+    except Exception: pass
+print(json.dumps(out))
+PY
+}
+
+# --- assemble -------------------------------------------------------------
+{
+  echo -n '{'
+  echo -n '"generated_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"'
+  echo -n ',"hostname":"'$(hostname)'"'
+  echo -n ',"disk":'$(disk_json)
+  echo -n ',"hotspots":'$(hotspot_json)
+  echo -n ',"packages":'$(packages_json)
+  echo -n ',"misc":'$(misc_json)
+  echo -n '}'
+} | python3 -m json.tool > "$TMP"
+
+mv "$TMP" "$SNAPSHOT"
+echo "$SNAPSHOT"

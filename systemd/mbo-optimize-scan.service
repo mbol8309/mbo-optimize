@@ -1,0 +1,12 @@
+[Unit]
+Description=Omarchy Optimize — weekly AI scan for disk and packages
+Documentation=https://github.com/mbol8309/mbo-optimize
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/omarchy-optimize-analyze
+# Notify the desktop that recommendations are ready (if any).
+ExecStartPost=/bin/bash -c '%h/.local/bin/omarchy-optimize-state read | grep -q "\"status\":\"pending\"" && notify-send -u normal -i drive-harddisk "Omarchy Optimize" "New optimization recommendations are ready. Click the Optimize icon in the bar." || true'
+
+[Install]
+WantedBy=default.target

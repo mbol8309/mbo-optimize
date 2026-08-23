@@ -1,0 +1,79 @@
+#!/bin/bash
+# omarchy-optimize-state — read/write the optimizer's state files.
+#
+# Subcommands:
+#   read            Print state.json as-is (or {} if missing).
+#   recommendations Print recommendations.json as an array (or []).
+#   dismiss <id>    Remove a recommendation by id and update state.
+#   reset           Clear state to {status:"idle"} (keeps snapshot).
+#   write <status> <count>
+#                   Manually set status + pending_count (used by the timer).
+
+set -euo pipefail
+
+STATE_DIR="${OMARCHY_OPTIMIZE_STATE_DIR:-$HOME/.local/state/omarchy/optimize}"
+mkdir -p "$STATE_DIR"
+STATE="$STATE_DIR/state.json"
+RECS="$STATE_DIR/recommendations.json"
+
+cmd="${1:-read}"
+[[ -z "${2:-}" || "$2" == "" ]] && shift || true
+[[ $# -ge 1 ]] && shift || true
+
+case "$cmd" in
+  read)
+    if [[ -f "$STATE" ]]; then cat "$STATE"; else echo '{}'; fi
+    ;;
+  recommendations)
+    if [[ -f "$RECS" ]]; then cat "$RECS"; else echo '[]'; fi
+    ;;
+  dismiss)
+    id="${1:-}"
+    [[ -n "$id" ]] || { echo "dismiss needs an id" >&2; exit 2; }
+    if [[ -f "$RECS" ]]; then
+      python3 - "$RECS" "$id" "$STATE" <<'PY'
+import json, sys, os, datetime
+recs_path, drop_id, state_path = sys.argv[1], sys.argv[2], sys.argv[3]
+recs = json.load(open(recs_path))
+recs = [r for r in recs if r.get("id") != drop_id]
+json.dump(recs, open(recs_path, "w"), indent=2)
+state = {}
+if os.path.exists(state_path):
+    try: state = json.load(open(state_path))
+    except: pass
+state["pending_count"] = len(recs)
+state["status"] = "optimized" if len(recs) == 0 else state.get("status", "pending")
+state["last_scan"] = state.get("last_scan") or datetime.datetime.now(datetime.timezone.utc).isoformat()
+json.dump(state, open(state_path, "w"), indent=2)
+PY
+    fi
+    echo "dismissed $id"
+    ;;
+  reset)
+    echo '{"status":"idle","pending_count":0,"last_scan":""}' > "$STATE"
+    echo "reset"
+    ;;
+  write)
+    status="${1:-idle}"
+    count="${2:-0}"
+    python3 - "$STATE" "$status" "$count" <<'PY'
+import json, sys, os, datetime
+path, status, count = sys.argv[1], sys.argv[2], int(sys.argv[3])
+state = {}
+if os.path.exists(path):
+    try: state = json.load(open(path))
+    except: pass
+state["status"] = status
+state["pending_count"] = count
+state["last_scan"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+json.dump(state, open(path, "w"), indent=2)
+PY
+    ;;
+  -h|--help|help)
+    echo "Usage: omarchy-optimize-state <read|recommendations|dismiss <id>|reset|write <status> <count>>"
+    ;;
+  *)
+    echo "unknown subcommand: $cmd" >&2
+    exit 2
+    ;;
+esac
