@@ -4,213 +4,283 @@
 # Args:
 #   apply <json-array-of-ids>   Run each selected recommendation by id.
 #
+# Generic execution contract (per recommendation):
+#   command   — what to run.
+#   timeout   — hard cap in seconds (default 120 / $OMARCHY_OPTIMIZE_TIMEOUT).
+#   monitor   — optional liveness command polled while running; non-zero aborts.
+#   verify    — success check (exit 0 => ok). Overrides built-in verification.
+#
 # Action handling:
-#   - "command"   : run the command verbatim. If it needs privileges, hand it
-#                  to a floating terminal so the password prompt is visible.
-#   - "uninstall" : pacman -Rns (needs sudo → floating terminal).
-#   - "delete"    : rm -rf the path under $HOME (no sudo for home files).
-#   - "cloud"     : hand off to the configured cloud handler (rclone,
-#                  local-send, tailscale) — see OMARCHY_OPTIMIZE_CLOUD.
+#   - "command"   : run verbatim. If it needs privileges, hand it to a floating
+#                   terminal so the password prompt is visible.
+#   - "uninstall" : pacman -Rns (needs sudo -> floating terminal).
+#   - "delete"    : remove the path under $HOME.
+#   - "cloud"     : hand off to the configured cloud handler.
 #   - "archive"   : tar the path into ~/Archive and remove the original.
 #
-# Writes a JSON object {id: "ok"|"failed"|"skipped"} to stdout.
+# Writes a JSON object {id: "ok"|"failed"|"partial"|"skipped"} to stdout, moves
+# every attempted item into history.json, removes it from recommendations.json,
+# and refreshes state.json.
 
 set -euo pipefail
 
-STATE_DIR="${OMARCHY_OPTIMIZE_STATE_DIR:-$HOME/.local/state/omarchy/optimize}"
-RECS="$STATE_DIR/recommendations.json"
-CLOUD="${OMARCHY_OPTIMIZE_CLOUD:-none}"
-FLOATING_TERMINAL="omarchy-launch-floating-terminal-with-presentation"
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  echo "Usage: $0 apply <json-array-of-ids>"
+  exit 0
+fi
+[[ "${1:-}" == "apply" ]] || { echo "Usage: $0 apply <json-array-of-ids>" >&2; exit 2; }
+[[ $# -ge 2 ]] || { echo "Usage: $0 apply <json-array-of-ids>" >&2; exit 2; }
 
-usage() { echo "Usage: $0 apply <json-array-of-ids>"; }
+exec python3 - "$@" <<'PY'
+import json, os, sys, subprocess, shutil, re, time, datetime
 
-if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then usage; exit 0; fi
-[[ ${1:-} == "apply" ]] || { usage >&2; exit 2; }
-shift
-[[ $# -ge 1 ]] || { usage >&2; exit 2; }
+STATE_DIR = os.environ.get("OMARCHY_OPTIMIZE_STATE_DIR") or os.path.expanduser("~/.local/state/omarchy/optimize")
+os.makedirs(STATE_DIR, exist_ok=True)
+STATE = os.path.join(STATE_DIR, "state.json")
+RECS = os.path.join(STATE_DIR, "recommendations.json")
+HISTORY = os.path.join(STATE_DIR, "history.json")
+DISCARDED = os.path.join(STATE_DIR, "dismissed.json")
+DEVNULL = subprocess.DEVNULL
+HOME = os.path.expanduser("~")
+FLOATING_TERMINAL = "omarchy-launch-floating-terminal-with-presentation"
 
-IDS_JSON="$1"
-[[ -f "$RECS" ]] || { echo "no recommendations.json" >&2; exit 1; }
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-RESULT=$(python3 - "$IDS_JSON" "$RECS" <<'PY'
-import json, sys, os
-ids = json.loads(sys.argv[1])
-recs = json.load(open(sys.argv[2]))
-by_id = {r["id"]: r for r in recs}
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def write_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+def rec_key(r):
+    action = (r.get("action") or "command")
+    if action == "uninstall":
+        pkg = (r.get("command") or r.get("path") or "").strip()
+        return ("uninstall:" + pkg) if pkg else "uninstall:"
+    if action in ("delete", "archive", "cloud"):
+        p = (r.get("command") or r.get("path") or "").strip()
+        return (action + ":" + p) if p else (action + ":")
+    cmd = (r.get("command") or "").strip()
+    if cmd:
+        return "command:" + cmd
+    return "suggest:" + (r.get("title") or r.get("id") or "").strip()
+
+def _timeout(r):
+    try:
+        t = int(r.get("timeout") or 0)
+    except Exception:
+        t = 0
+    if t <= 0:
+        try:
+            t = int(os.environ.get("OMARCHY_OPTIMIZE_TIMEOUT", "120"))
+        except Exception:
+            t = 120
+    return t
+
+def _kill(proc):
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+def needs_sudo(cmd):
+    return any(t in cmd for t in ("sudo", "pkexec", "pacman", "systemctl", "rm -rf /"))
+
+def run_sudo_in_terminal(cmd):
+    if shutil.which(FLOATING_TERMINAL):
+        try:
+            r = subprocess.run([FLOATING_TERMINAL, cmd + "; omarchy show done"],
+                               stdout=DEVNULL, stderr=DEVNULL)
+            return r.returncode
+        except Exception:
+            return 1
+    try:
+        r = subprocess.run(["pkexec", "bash", "-c", cmd], stdout=DEVNULL, stderr=DEVNULL)
+        return r.returncode
+    except Exception:
+        return 1
+
+def run_command(cmd, timeout_s, monitor):
+    """Run a command with a hard timeout and an optional liveness monitor.
+
+    Returns the exit code, or 124 on timeout, 125 when the monitor reports
+    the run has stalled.
+    """
+    proc = subprocess.Popen(cmd, shell=True, stdout=DEVNULL, stderr=DEVNULL)
+    deadline = time.time() + timeout_s
+    try:
+        while True:
+            code = proc.poll()
+            if code is not None:
+                return code
+            if time.time() > deadline:
+                _kill(proc)
+                return 124
+            if monitor:
+                try:
+                    m = subprocess.run(monitor, shell=True, stdout=DEVNULL, stderr=DEVNULL, timeout=10)
+                    if m.returncode != 0:
+                        _kill(proc)
+                        return 125
+                except subprocess.TimeoutExpired:
+                    _kill(proc)
+                    return 125
+            time.sleep(2)
+    except Exception:
+        _kill(proc)
+        return 125
+
+def verify_uninstall(pkgs):
+    total, still = 0, 0
+    for pkg in pkgs.split():
+        total += 1
+        rc = subprocess.run(["pacman", "-Qi", pkg], stdout=DEVNULL, stderr=DEVNULL).returncode
+        if rc == 0:
+            still += 1
+    if still == 0:
+        return "ok"
+    if still == total:
+        return "failed"
+    return "partial"
+
+def run_cloud(target, timeout_s):
+    cloud = os.environ.get("OMARCHY_OPTIMIZE_CLOUD", "none")
+    try:
+        if cloud == "rclone":
+            if not shutil.which("rclone"):
+                return "skipped"
+            r = subprocess.run(["rclone", "copy", target, "omarchy-optimize:" + os.path.basename(target)],
+                               stdout=DEVNULL, stderr=DEVNULL, timeout=timeout_s)
+        elif cloud == "local-send":
+            r = subprocess.run(["omarchy", "share", "file", target],
+                               stdout=DEVNULL, stderr=DEVNULL, timeout=timeout_s)
+        elif cloud == "tailscale":
+            r = subprocess.run(["omarchy", "tailscale", "send", target],
+                               stdout=DEVNULL, stderr=DEVNULL, timeout=timeout_s)
+        else:
+            return "skipped"
+        return "ok" if r.returncode == 0 else "failed"
+    except Exception:
+        return "failed"
+
+def run_action(r):
+    action = (r.get("action") or "command")
+    timeout_s = _timeout(r)
+    monitor = (r.get("monitor") or "").strip()
+    verify = (r.get("verify") or "").strip()
+
+    if action == "command":
+        cmd = (r.get("command") or "").strip()
+        if not cmd:
+            status = "skipped"
+        elif needs_sudo(cmd):
+            status = "ok" if run_sudo_in_terminal(cmd) == 0 else "failed"
+        else:
+            ec = run_command(cmd, timeout_s, monitor)
+            status = "ok" if ec == 0 else "failed"
+    elif action == "uninstall":
+        pkgs = (r.get("command") or r.get("path") or "").strip()
+        if not pkgs:
+            status = "skipped"
+        else:
+            run_sudo_in_terminal("sudo pacman -Rns --noconfirm " + pkgs)
+            status = verify_uninstall(pkgs)
+    elif action == "delete":
+        target = (r.get("command") or r.get("path") or "").strip()
+        if not target:
+            status = "skipped"
+        else:
+            target = os.path.expanduser(target)
+            if target in ("/", HOME):
+                status = "skipped"
+            else:
+                try:
+                    shutil.rmtree(target, ignore_errors=True)
+                except Exception:
+                    pass
+                status = "ok" if not os.path.exists(target) else "failed"
+    elif action == "archive":
+        target = (r.get("command") or r.get("path") or "").strip()
+        if not target:
+            status = "skipped"
+        else:
+            target = os.path.expanduser(target)
+            archive_dir = os.path.join(HOME, "Archive")
+            os.makedirs(archive_dir, exist_ok=True)
+            name = os.path.basename(target.rstrip("/"))
+            archive_path = os.path.join(archive_dir, name + ".tar.gz")
+            try:
+                subprocess.run(["tar", "-czf", archive_path, "-C", os.path.dirname(target) or "/", name],
+                               stdout=DEVNULL, stderr=DEVNULL, timeout=timeout_s)
+                if os.path.isfile(archive_path) and not os.path.exists(target):
+                    status = "ok"
+                elif os.path.isfile(archive_path):
+                    status = "partial"
+                else:
+                    status = "failed"
+            except Exception:
+                status = "failed"
+    elif action == "cloud":
+        target = (r.get("command") or r.get("path") or "").strip()
+        status = run_cloud(os.path.expanduser(target), timeout_s) if target else "skipped"
+    else:
+        status = "skipped"
+
+    if verify and status != "skipped":
+        try:
+            v = subprocess.run(verify, shell=True, stdout=DEVNULL, stderr=DEVNULL, timeout=30)
+            if v.returncode == 0:
+                status = "ok"
+            elif status == "ok":
+                status = "failed"
+        except Exception:
+            if status == "ok":
+                status = "failed"
+    return status
+
+# --- entrypoint ------------------------------------------------------------
+ids = json.loads(sys.argv[2])
+recs = read_json(RECS, [])
+if not isinstance(recs, list):
+    recs = []
+by_id = {r.get("id"): r for r in recs if isinstance(r, dict)}
 selected = [by_id[i] for i in ids if i in by_id]
-# Print one JSON object per line so bash can read them safely.
+
+results = {}
 for r in selected:
-    print(json.dumps({
-        "id": r["id"],
-        "action": r.get("action","command"),
-        "path": r.get("path",""),
-        "command": r.get("command",""),
-    }))
+    results[r["id"]] = run_action(r)
+
+# Persist: move attempted items to history, drop them from pending, refresh state.
+selected_ids = set(r["id"] for r in selected)
+recs = [r for r in recs if r.get("id") not in selected_ids]
+write_json(RECS, recs)
+
+history = read_json(HISTORY, [])
+if not isinstance(history, list):
+    history = []
+for r in selected:
+    h = dict(r)
+    h["status"] = results[r["id"]]
+    h["key"] = rec_key(r)
+    h["applied_at"] = now_iso()
+    history = [x for x in history if x.get("id") != h.get("id")]
+    history.append(h)
+write_json(HISTORY, history)
+
+state = read_json(STATE, {})
+state["pending_count"] = len(recs)
+state["status"] = "pending" if recs else "optimized"
+write_json(STATE, state)
+
+print(json.dumps(results, indent=2))
 PY
-)
-
-run_sudo_in_terminal() {
-  local cmd="$1"
-  if command -v "$FLOATING_TERMINAL" >/dev/null 2>&1; then
-    $FLOATING_TERMINAL "$cmd; omarchy show done" 2>/dev/null
-    return $?
-  else
-    pkexec bash -c "$cmd" 2>/dev/null
-    return $?
-  fi
-}
-
-declare -A STATUS
-
-# Verify that packages are actually uninstalled. Sets STATUS[$id] based on
-# how many packages still appear installed.
-verify_uninstall() {
-  local pkgs="$1"
-  local still_installed=0
-  local total=0
-  for pkg in $pkgs; do
-    total=$((total + 1))
-    if pacman -Qi "$pkg" >/dev/null 2>&1; then
-      still_installed=$((still_installed + 1))
-    fi
-  done
-  if [[ $still_installed -eq 0 ]]; then
-    : # keep STATUS=ok
-  elif [[ $still_installed -eq $total ]]; then
-    STATUS[$id]="failed"
-  else
-    STATUS[$id]="partial"
-  fi
-}
-
-while IFS= read -r line; do
-  [[ -n "$line" ]] || continue
-  # Parse the JSON line safely (avoids tab-splitting issues with empty fields).
-  id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$line")
-  action=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["action"])' <<<"$line")
-  path=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])' <<<"$line")
-  command=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["command"])' <<<"$line")
-  verify=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("verify",""))' <<<"$line")
-  STATUS[$id]="ok"
-  case "$action" in
-    command)
-      [[ -n "$command" ]] || { STATUS[$id]="skipped"; continue; }
-      if grep -qE "sudo|pkexec|pacman|systemctl|rm -rf /" <<<"$command"; then
-        run_sudo_in_terminal "$command"
-        ec=$?
-        if [[ $ec -ne 0 ]]; then STATUS[$id]="failed"; else STATUS[$id]="ok"; fi
-      else
-        set +e
-        bash -c "$command" >/dev/null 2>&1
-        ec=$?
-        set -e
-        if [[ $ec -eq 0 ]]; then STATUS[$id]="ok"
-        else STATUS[$id]="partial"; fi
-      fi
-      ;;
-    uninstall)
-      pkgs="${command:-$path}"
-      [[ -n "$pkgs" ]] || { STATUS[$id]="skipped"; continue; }
-      run_sudo_in_terminal "sudo pacman -Rns --noconfirm $pkgs"
-      ec=$?
-      if [[ $ec -ne 0 ]]; then
-        STATUS[$id]="failed"
-      else
-        verify_uninstall "$pkgs"
-      fi
-      ;;
-    delete)
-      target="${command:-$path}"
-      [[ -n "$target" ]] || { STATUS[$id]="skipped"; continue; }
-      target="${target/#\~/$HOME}"
-      if [[ "$target" == "$HOME" || "$target" == "/" ]]; then
-        STATUS[$id]="skipped"; continue
-      fi
-      set +e
-      rm -rf -- "$target" >/dev/null 2>&1
-      set -e
-      if [[ ! -e "$target" ]]; then STATUS[$id]="ok"
-      else STATUS[$id]="failed"; fi
-      ;;
-    archive)
-      target="${command:-$path}"
-      [[ -n "$target" ]] || { STATUS[$id]="skipped"; continue; }
-      target="${target/#\~/$HOME}"
-      archive_dir="$HOME/Archive"
-      mkdir -p "$archive_dir"
-      name="$(basename "$target")"
-      archive_path="$archive_dir/${name}.tar.gz"
-      set +e
-      tar -czf "$archive_path" -C "$(dirname "$target")" "$name" >/dev/null 2>&1
-      set -e
-      if [[ -f "$archive_path" ]] && [[ ! -e "$target" ]]; then
-        STATUS[$id]="ok"
-      elif [[ -f "$archive_path" ]]; then
-        STATUS[$id]="partial"
-      else
-        STATUS[$id]="failed"
-      fi
-      ;;
-    cloud)
-      target="${command:-$path}"
-      [[ -n "$target" ]] || { STATUS[$id]="skipped"; continue; }
-      target="${target/#\~/$HOME}"
-      case "$CLOUD" in
-        rclone)
-          command -v rclone >/dev/null 2>&1 || { STATUS[$id]="skipped"; continue; }
-          set +e
-          rclone copy "$target" "omarchy-optimize:$(basename "$target")" >/dev/null 2>&1
-          ec=$?
-          set -e
-          if [[ $ec -eq 0 ]]; then STATUS[$id]="ok"; else STATUS[$id]="failed"; fi
-          ;;
-        local-send)
-          set +e
-          omarchy share file "$target" >/dev/null 2>&1
-          ec=$?
-          set -e
-          if [[ $ec -eq 0 ]]; then STATUS[$id]="ok"; else STATUS[$id]="failed"; fi
-          ;;
-        tailscale)
-          set +e
-          omarchy tailscale send "$target" >/dev/null 2>&1
-          ec=$?
-          set -e
-          if [[ $ec -eq 0 ]]; then STATUS[$id]="ok"; else STATUS[$id]="failed"; fi
-          ;;
-        *)
-          STATUS[$id]="skipped"
-          ;;
-      esac
-      ;;
-    suggest|*)
-      STATUS[$id]="skipped"
-      ;;
-  esac
-
-  # If the agent provided a verify command, run it to confirm the action
-  # actually took effect. This overrides the built-in verification.
-  if [[ -n "$verify" && "${STATUS[$id]}" != "skipped" ]]; then
-    set +e
-    bash -c "$verify" >/dev/null 2>&1
-    local vec=$?
-    set -e
-    if [[ $vec -eq 0 ]]; then
-      STATUS[$id]="ok"
-    else
-      [[ "${STATUS[$id]}" == "ok" ]] && STATUS[$id]="failed"
-    fi
-  fi
-done <<<"$RESULT"
-
-# Emit JSON result: {id: "ok"|"failed"|"skipped"}.
-{
-  echo -n '{'
-  first=1
-  for id in "${!STATUS[@]}"; do
-    [[ $first -eq 0 ]] && echo -n ','
-    printf '"%s":"%s"' "$id" "${STATUS[$id]}"
-    first=0
-  done
-  echo -n '}'
-} | python3 -m json.tool

@@ -2,110 +2,210 @@
 # omarchy-optimize-state — read/write the optimizer's state files.
 #
 # Subcommands:
-#   read            Print state.json as-is (or {} if missing).
-#   recommendations Print recommendations.json as an array (or []).
-#   dismiss <id>    Remove a recommendation by id and update state.
-#   reset           Clear state to {status:"idle"} (keeps snapshot).
+#   read               Print state.json (or {} if missing).
+#   recommendations    Print recommendations.json (pending list).
+#   history            Print history.json (applied items).
+#   list-dismissed     Print dismissed.json (discarded items).
+#   dismiss <id>       Move a pending rec to the dismissed blocklist (keyed).
+#   restore <id>       Remove a rec from the dismissed blocklist.
+#   retry <id>         Move a history item back into pending.
+#   reconcile          Prune pending recs whose target is already gone.
+#   clear-history      Empty history.json.
+#   reset              Clear state to {status:"idle"}.
 #   write <status> <count>
-#                   Manually set status + pending_count (used by the timer).
+#                      Manually set status + pending_count.
 
 set -euo pipefail
+exec python3 - "$@" <<'PY'
+import json, os, sys, datetime, subprocess
 
-STATE_DIR="${OMARCHY_OPTIMIZE_STATE_DIR:-$HOME/.local/state/omarchy/optimize}"
-mkdir -p "$STATE_DIR"
-STATE="$STATE_DIR/state.json"
-RECS="$STATE_DIR/recommendations.json"
-DISMISSED="$STATE_DIR/dismissed.json"
+STATE_DIR = os.environ.get("OMARCHY_OPTIMIZE_STATE_DIR") or os.path.expanduser("~/.local/state/omarchy/optimize")
+os.makedirs(STATE_DIR, exist_ok=True)
+STATE = os.path.join(STATE_DIR, "state.json")
+RECS = os.path.join(STATE_DIR, "recommendations.json")
+DISMISSED = os.path.join(STATE_DIR, "dismissed.json")
+HISTORY = os.path.join(STATE_DIR, "history.json")
 
-ensure_dismissed() {
-  [[ -f "$DISMISSED" ]] || echo '[]' > "$DISMISSED"
-}
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-cmd="${1:-read}"
-[[ -z "${2:-}" || "$2" == "" ]] && shift || true
-[[ $# -ge 1 ]] && shift || true
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
 
-case "$cmd" in
-  read)
-    if [[ -f "$STATE" ]]; then cat "$STATE"; else echo '{}'; fi
-    ;;
-  recommendations)
-    if [[ -f "$RECS" ]]; then cat "$RECS"; else echo '[]'; fi
-    ;;
-  dismiss)
-    id="${1:-}"
-    [[ -n "$id" ]] || { echo "dismiss needs an id" >&2; exit 2; }
-    ensure_dismissed
-    if [[ -f "$RECS" ]]; then
-      python3 - "$RECS" "$id" "$STATE" "$DISMISSED" <<'PY'
-import json, sys, os, datetime
-recs_path, drop_id, state_path, dismissed_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-# Remove from current recommendations.
-recs = json.load(open(recs_path))
-recs = [r for r in recs if r.get("id") != drop_id]
-json.dump(recs, open(recs_path, "w"), indent=2)
-# Add to persistent blocklist (dedupe by id).
-try: dismissed = json.load(open(dismissed_path))
-except: dismissed = []
-if not any(d.get("id") == drop_id for d in dismissed):
-  dismissed.append({"id": drop_id, "dismissed_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
-json.dump(dismissed, open(dismissed_path, "w"), indent=2)
-# Update state.
-state = {}
-if os.path.exists(state_path):
-    try: state = json.load(open(state_path))
-    except: pass
-state["pending_count"] = len(recs)
-state["status"] = "optimized" if len(recs) == 0 else state.get("status", "pending")
-state["last_scan"] = state.get("last_scan") or datetime.datetime.now(datetime.timezone.utc).isoformat()
-json.dump(state, open(state_path, "w"), indent=2)
+def write_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+def rec_key(r):
+    """Stable identity for a recommendation, independent of the AI's slug."""
+    action = (r.get("action") or "command")
+    if action == "uninstall":
+        pkg = (r.get("command") or r.get("path") or "").strip()
+        return ("uninstall:" + pkg) if pkg else "uninstall:"
+    if action in ("delete", "archive", "cloud"):
+        p = (r.get("command") or r.get("path") or "").strip()
+        return (action + ":" + p) if p else (action + ":")
+    cmd = (r.get("command") or "").strip()
+    if cmd:
+        return "command:" + cmd
+    return "suggest:" + (r.get("title") or r.get("id") or "").strip()
+
+def update_state_pending():
+    recs = read_json(RECS, [])
+    if not isinstance(recs, list):
+        recs = []
+    state = read_json(STATE, {})
+    state["pending_count"] = len(recs)
+    state["status"] = "pending" if recs else "optimized"
+    state["last_scan"] = state.get("last_scan") or now_iso()
+    write_json(STATE, state)
+
+def target_gone(r):
+    """Return True if a recommendation's target no longer exists (already done)."""
+    action = (r.get("action") or "command")
+    if action == "uninstall":
+        pkgs = (r.get("command") or r.get("path") or "").split()
+        if not pkgs:
+            return False
+        # Gone only if none of the packages are still installed.
+        for pkg in pkgs:
+            rc = subprocess.run(["pacman", "-Qi", pkg],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+            if rc == 0:
+                return False
+        return True
+    if action in ("delete", "archive", "cloud"):
+        p = (r.get("command") or r.get("path") or "").strip()
+        if not p:
+            return False
+        return not os.path.exists(os.path.expanduser(p))
+    return False
+
+def reconcile():
+    recs = read_json(RECS, [])
+    if not isinstance(recs, list):
+        recs = []
+    keep, moved = [], []
+    for r in recs:
+        if isinstance(r, dict) and target_gone(r):
+            moved.append(r)
+        else:
+            keep.append(r)
+    if moved:
+        history = read_json(HISTORY, [])
+        if not isinstance(history, list):
+            history = []
+        for r in moved:
+            h = dict(r)
+            h["status"] = "applied"
+            h["key"] = rec_key(r)
+            h["applied_at"] = now_iso()
+            history = [x for x in history if x.get("id") != h.get("id")]
+            history.append(h)
+        write_json(HISTORY, history)
+        write_json(RECS, keep)
+        update_state_pending()
+        print("reconciled %d stale recommendation(s)" % len(moved))
+    else:
+        print("reconciled 0")
+
+def err(msg):
+    sys.stderr.write(msg + "\n")
+    raise SystemExit(2)
+
+cmd = sys.argv[1] if len(sys.argv) > 1 else "read"
+args = sys.argv[2:]
+
+if cmd == "read":
+    print(json.dumps(read_json(STATE, {}), indent=2))
+elif cmd == "recommendations":
+    print(json.dumps(read_json(RECS, []), indent=2))
+elif cmd == "history":
+    print(json.dumps(read_json(HISTORY, []), indent=2))
+elif cmd == "list-dismissed":
+    print(json.dumps(read_json(DISMISSED, []), indent=2))
+elif cmd == "dismiss":
+    rid = args[0] if args else ""
+    if not rid:
+        err("dismiss needs an id")
+    recs = read_json(RECS, [])
+    if not isinstance(recs, list):
+        recs = []
+    target = next((r for r in recs if isinstance(r, dict) and r.get("id") == rid), None)
+    recs = [r for r in recs if not (isinstance(r, dict) and r.get("id") == rid)]
+    write_json(RECS, recs)
+    dismissed = read_json(DISMISSED, [])
+    if not isinstance(dismissed, list):
+        dismissed = []
+    entry = {"id": rid, "dismissed_at": now_iso()}
+    if target:
+        entry.update({
+            "key": rec_key(target),
+            "title": target.get("title", ""),
+            "action": target.get("action", ""),
+            "command": target.get("command", ""),
+            "path": target.get("path", ""),
+            "savings_gb": target.get("savings_gb", 0),
+            "severity": target.get("severity", ""),
+        })
+    dismissed = [d for d in dismissed if d.get("id") != rid]
+    dismissed.append(entry)
+    write_json(DISMISSED, dismissed)
+    update_state_pending()
+    print("dismissed " + rid)
+elif cmd == "restore":
+    rid = args[0] if args else ""
+    if not rid:
+        err("restore needs an id")
+    dismissed = read_json(DISMISSED, [])
+    if not isinstance(dismissed, list):
+        dismissed = []
+    write_json(DISMISSED, [d for d in dismissed if d.get("id") != rid])
+    print("restored " + rid)
+elif cmd == "retry":
+    rid = args[0] if args else ""
+    if not rid:
+        err("retry needs an id")
+    history = read_json(HISTORY, [])
+    if not isinstance(history, list):
+        history = []
+    entry = next((h for h in history if h.get("id") == rid), None)
+    history = [h for h in history if h.get("id") != rid]
+    write_json(HISTORY, history)
+    if not entry:
+        print("not found " + rid)
+    else:
+        rec = {k: v for k, v in entry.items() if k not in ("status", "applied_at", "key")}
+        recs = read_json(RECS, [])
+        if not isinstance(recs, list):
+            recs = []
+        recs = [r for r in recs if r.get("id") != rid]
+        recs.append(rec)
+        write_json(RECS, recs)
+        update_state_pending()
+        print("retried " + rid)
+elif cmd == "clear-history":
+    write_json(HISTORY, [])
+    print("history cleared")
+elif cmd == "reconcile":
+    reconcile()
+elif cmd == "reset":
+    write_json(STATE, {"status": "idle", "pending_count": 0, "last_scan": ""})
+    print("reset")
+elif cmd == "write":
+    status = args[0] if len(args) > 0 else "idle"
+    count = int(args[1]) if len(args) > 1 else 0
+    state = read_json(STATE, {})
+    state["status"] = status
+    state["pending_count"] = count
+    state["last_scan"] = now_iso()
+    write_json(STATE, state)
+elif cmd in ("-h", "--help", "help"):
+    print("Usage: omarchy-optimize-state <read|recommendations|history|list-dismissed|dismiss <id>|restore <id>|retry <id>|reconcile|clear-history|reset|write <status> <count>>")
+else:
+    err("unknown subcommand: " + cmd)
 PY
-    fi
-    echo "dismissed $id (won't be recommended again)"
-    ;;
-  list-dismissed)
-    ensure_dismissed
-    cat "$DISMISSED"
-    ;;
-  restore)
-    id="${1:-}"
-    [[ -n "$id" ]] || { echo "restore needs an id" >&2; exit 2; }
-    ensure_dismissed
-    python3 - "$DISMISSED" "$id" <<'PY'
-import json, sys
-path, rid = sys.argv[1], sys.argv[2]
-try: dismissed = json.load(open(path))
-except: dismissed = []
-dismissed = [d for d in dismissed if d.get("id") != rid]
-json.dump(dismissed, open(path, "w"), indent=2)
-PY
-    echo "restored $id (will be recommended again on next scan)"
-    ;;
-  reset)
-    echo '{"status":"idle","pending_count":0,"last_scan":""}' > "$STATE"
-    echo "reset"
-    ;;
-  write)
-    status="${1:-idle}"
-    count="${2:-0}"
-    python3 - "$STATE" "$status" "$count" <<'PY'
-import json, sys, os, datetime
-path, status, count = sys.argv[1], sys.argv[2], int(sys.argv[3])
-state = {}
-if os.path.exists(path):
-    try: state = json.load(open(path))
-    except: pass
-state["status"] = status
-state["pending_count"] = count
-state["last_scan"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-json.dump(state, open(path, "w"), indent=2)
-PY
-    ;;
-  -h|--help|help)
-    echo "Usage: omarchy-optimize-state <read|recommendations|dismiss <id>|list-dismissed|restore <id>|reset|write <status> <count>>"
-    ;;
-  *)
-    echo "unknown subcommand: $cmd" >&2
-    exit 2
-    ;;
-esac

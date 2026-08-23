@@ -21,6 +21,8 @@ For each recommendation, produce an object with these fields:
 - `command` (optional, required for command/uninstall/delete/cloud/archive): the exact shell command to run. For `uninstall`, put the space-separated package names. For `delete`/`archive`/`cloud`, put the path (e.g. ~/Downloads/old.iso). For `command`, put the full command. Leave empty for `suggest`.
 - `verify` (optional): a shell command that returns exit 0 if the action succeeded. E.g. for deleting a file: `test ! -e ~/Downloads/old.iso`. For uninstalling a package: `! pacman -Qi rust >/dev/null 2>&1`. If omitted, the apply script uses built-in verification per action type.
 - `path` (optional): the target path when not redundant with `command`
+- `timeout` (optional, seconds): hard cap for how long `command` may run. Omit to use the default (120). Set higher for big copies/archives (e.g. 600), lower for quick checks.
+- `monitor` (optional): a liveness command the apply script polls while `command` runs. It must exit 0 while things are progressing. If it returns non-zero, the run is aborted as stalled instead of hanging forever. Only include it for commands that can silently stall. For docker image removal, use `docker info >/dev/null 2>&1`; for network copies, use something that confirms the transfer is still moving.
 
 ### Action semantics (the apply script enforces these)
 
@@ -73,6 +75,18 @@ Reply with ONLY a fenced ```json block containing an array of recommendation obj
     "savings_gb": 0.9,
     "action": "command",
     "command": "sudo journalctl --vacuum-size=200M"
+  },
+  {
+    "id": "docker-images",
+    "title": "Remove unused Docker images",
+    "rationale": "docker_images lists 3 unused images totaling 4.0 GB.",
+    "severity": "medium",
+    "savings_gb": 4.0,
+    "action": "command",
+    "command": "docker image rm img1 img2 img3",
+    "verify": "test -z \"$(docker images -q img1 img2 img3 2>/dev/null)\"",
+    "timeout": 120,
+    "monitor": "docker info >/dev/null 2>&1"
   }
 ]
 ```

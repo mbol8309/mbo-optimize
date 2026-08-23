@@ -30,6 +30,10 @@ Panel {
   property string viewMode: "list"   // "list" | "results"
   property int appliedVersion: 0     // bump to force bindings to re-evaluate applied[]
   property bool applyFinished: false // true when applyProc exits
+  property var applyRecs: ({})       // id -> rec snapshot captured at submit time
+  property string tab: "pending"     // "pending" | "history" | "discarded"
+  property var history: []
+  property var discarded: []
 
   readonly property string status: state.status || "idle"
   readonly property int pendingCount: state.pending_count || 0
@@ -83,6 +87,8 @@ Panel {
     if (selectedCount === 0) return
     var ids = Object.keys(selected)
     applyOrder = ids
+    var snap = {}; for (var i = 0; i < ids.length; i++) { var r = recById(ids[i]); if (r) snap[ids[i]] = r }
+    applyRecs = snap
     var marked = {}; for (var i = 0; i < ids.length; i++) marked[ids[i]] = "running"
     applied = marked
     appliedVersion = 0
@@ -96,6 +102,7 @@ Panel {
     viewMode = "list"
     applied = ({})
     applyOrder = []
+    applyRecs = ({})
     appliedVersion = 0
     applyFinished = false
   }
@@ -104,6 +111,21 @@ Panel {
     dismissProc.command = ["omarchy-optimize-state", "dismiss", id]
     dismissProc.running = true
   }
+
+  function retry(id) {
+    retryProc.command = ["omarchy-optimize-state", "retry", id]
+    retryProc.running = true
+  }
+
+  function restore(id) {
+    restoreProc.command = ["omarchy-optimize-state", "restore", id]
+    restoreProc.running = true
+  }
+
+  function setTab(t) { tab = t }
+  function refreshHistory()   { if (!historyProc.running)   historyProc.running   = true }
+  function refreshDiscarded() { if (!discardedProc.running) discardedProc.running = true }
+  function reconcileNow()     { if (!reconcileProc.running) reconcileProc.running = true }
 
   // Helper: find a rec by id
   function recById(id) {
@@ -127,6 +149,9 @@ Panel {
     }
     function refresh(): string { root.refreshState(); root.refreshRecs(); return "ok" }
     function dismiss(id: string): string { root.dismiss(id); return "ok" }
+    function retry(id: string): string { root.retry(id); return "ok" }
+    function restore(id: string): string { root.restore(id); return "ok" }
+    function setTab(t: string): string { root.setTab(t); return "ok" }
   }
 
   // ----- bar button --------------------------------------------------------
@@ -218,35 +243,66 @@ Panel {
           }
         }
 
+        // --- Tabs (Pending / History / Discarded) ---
+        Row {
+          width: parent.width
+          spacing: Style.space(6)
+          visible: viewMode === "list"
+
+          Button {
+            text: "Pending (" + pendingCount + ")"
+            selected: root.tab === "pending"
+            onClicked: root.setTab("pending")
+          }
+          Button {
+            text: "History (" + history.length + ")"
+            selected: root.tab === "history"
+            onClicked: root.setTab("history")
+          }
+          Button {
+            text: "Discarded (" + discarded.length + ")"
+            selected: root.tab === "discarded"
+            onClicked: root.setTab("discarded")
+          }
+        }
+
         // --- Action bar (changes with mode) ---
         Row {
           width: parent.width
           spacing: Style.space(6)
 
-          // List mode actions
+          // Pending tab actions
           Button {
             text: "Scan"
             enabled: !scanning && viewMode === "list"
-            visible: viewMode === "list"
+            visible: viewMode === "list" && root.tab === "pending"
             onClicked: root.scanNow()
           }
           Button {
             text: "Select all"
             enabled: recommendations.length > 0 && viewMode === "list"
-            visible: viewMode === "list"
+            visible: viewMode === "list" && root.tab === "pending"
             onClicked: root.selectAll()
           }
           Button {
             text: "Clear"
             enabled: selectedCount > 0 && viewMode === "list"
-            visible: viewMode === "list"
+            visible: viewMode === "list" && root.tab === "pending"
             onClicked: root.selectNone()
           }
           Button {
             text: "Execute (" + selectedCount + ")"
             enabled: selectedCount > 0 && !scanning && viewMode === "list"
-            visible: viewMode === "list"
+            visible: viewMode === "list" && root.tab === "pending"
             onClicked: root.applySelected()
+          }
+
+          // History tab actions
+          Button {
+            text: "Clear history"
+            enabled: history.length > 0 && viewMode === "list"
+            visible: viewMode === "list" && root.tab === "history"
+            onClicked: clearHistoryProc.running = true
           }
 
           // Results mode actions
@@ -269,7 +325,10 @@ Panel {
         anchors.top: headerCol.bottom
         anchors.bottom: parent.bottom
         anchors.topMargin: Style.space(8)
-        implicitHeight: viewMode === "results" ? resultsColumn.implicitHeight : listColumn.implicitHeight
+        implicitHeight: viewMode === "results" ? resultsColumn.implicitHeight
+          : root.tab === "history" ? historyColumn.implicitHeight
+          : root.tab === "discarded" ? discardedColumn.implicitHeight
+          : listColumn.implicitHeight
 
         // ===== RECOMMENDATIONS LIST (viewMode === "list") =====
         Flickable {
@@ -281,7 +340,7 @@ Panel {
           boundsBehavior: Flickable.StopAtBounds
           flickableDirection: Flickable.VerticalFlick
           interactive: contentHeight > height
-          visible: root.viewMode === "list"
+          visible: root.viewMode === "list" && root.tab === "pending"
           ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
           Column {
@@ -460,7 +519,7 @@ Panel {
                 color: root.surface
                 radius: Style.space(6)
                 property string rid: modelData
-                property var rec: root.recById(rid)
+                property var rec: root.applyRecs[rid] || root.recById(rid)
                 // Depend on appliedVersion so this re-evaluates when applied changes.
                 property string st: { var _ = root.appliedVersion; return root.applied[rid] || "pending" }
 
@@ -583,6 +642,223 @@ Panel {
             }
           }
         }
+
+        // ===== HISTORY VIEW (tab === "history") =====
+        Flickable {
+          id: historyFlick
+          anchors.fill: parent
+          contentWidth: width
+          contentHeight: historyColumn.implicitHeight
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          flickableDirection: Flickable.VerticalFlick
+          interactive: contentHeight > height
+          visible: root.viewMode === "list" && root.tab === "history"
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+          Column {
+            id: historyColumn
+            width: historyFlick.width
+            spacing: Style.space(10)
+
+            PanelSectionHeader { text: "History" }
+
+            Text {
+              width: parent.width
+              visible: root.history.length === 0
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              wrapMode: Text.Wrap
+              text: "Nothing applied yet. Executed optimizations land here with their outcome."
+            }
+
+            Repeater {
+              model: root.history
+              delegate: Rectangle {
+                id: hcard
+                width: historyFlick.width
+                height: hcol.implicitHeight + Style.space(16)
+                color: root.surface
+                radius: Style.space(6)
+                property var rec: modelData
+
+                Column {
+                  id: hcol
+                  anchors.left: parent.left; anchors.right: parent.right
+                  anchors.margins: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(4)
+
+                  Row {
+                    width: parent.width
+                    spacing: Style.space(8)
+                    Text {
+                      id: hstatus
+                      text: {
+                        if (rec.status === "ok") return "\uf00c"
+                        if (rec.status === "partial") return "\uf12a"
+                        if (rec.status === "failed") return "\uf00d"
+                        if (rec.status === "skipped") return "\uf04e"
+                        return "\uf017"
+                      }
+                      color: rec.status === "ok" ? root.good
+                             : (rec.status === "failed" || rec.status === "partial") ? root.urgent
+                             : root.dim
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.body
+                    }
+                    Text {
+                      width: parent.width - hstatus.width - hretry.implicitWidth - Style.space(16)
+                      text: rec.title || rec.id
+                      color: root.foreground
+                      font.bold: true
+                      font.family: root.fontFamily
+                      wrapMode: Text.Wrap
+                    }
+                    Button {
+                      id: hretry
+                      text: "Retry"
+                      onClicked: root.retry(rec.id)
+                    }
+                  }
+
+                  Text {
+                    width: parent.width
+                    text: rec.rationale || ""
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.Wrap
+                  }
+
+                  Row {
+                    spacing: Style.space(6)
+                    Text {
+                      text: (rec.status || "").toUpperCase()
+                      color: rec.status === "ok" ? root.good
+                             : (rec.status === "failed" || rec.status === "partial") ? root.urgent
+                             : root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                    Text {
+                      visible: !!rec.savings_gb
+                      text: "≈ " + Number(rec.savings_gb).toFixed(1) + " GB"
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                    Text {
+                      visible: !!rec.applied_at
+                      text: (rec.applied_at || "").slice(0, 10)
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // ===== DISCARDED VIEW (tab === "discarded") =====
+        Flickable {
+          id: discardedFlick
+          anchors.fill: parent
+          contentWidth: width
+          contentHeight: discardedColumn.implicitHeight
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          flickableDirection: Flickable.VerticalFlick
+          interactive: contentHeight > height
+          visible: root.viewMode === "list" && root.tab === "discarded"
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+          Column {
+            id: discardedColumn
+            width: discardedFlick.width
+            spacing: Style.space(10)
+
+            PanelSectionHeader { text: "Discarded" }
+
+            Text {
+              width: parent.width
+              visible: root.discarded.length === 0
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              wrapMode: Text.Wrap
+              text: "Nothing discarded. Dismissed recommendations stay here so they won't be suggested again."
+            }
+
+            Repeater {
+              model: root.discarded
+              delegate: Rectangle {
+                id: dcard
+                width: discardedFlick.width
+                height: dcol.implicitHeight + Style.space(16)
+                color: root.surface
+                radius: Style.space(6)
+                property var rec: modelData
+
+                Column {
+                  id: dcol
+                  anchors.left: parent.left; anchors.right: parent.right
+                  anchors.margins: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(4)
+
+                  Row {
+                    width: parent.width
+                    spacing: Style.space(8)
+                    Text {
+                      id: dicon
+                      text: "\uf05e"
+                      color: root.dim
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.body
+                    }
+                    Text {
+                      width: parent.width - dicon.width - drestore.implicitWidth - Style.space(16)
+                      text: rec.title || rec.id
+                      color: root.foreground
+                      font.bold: true
+                      font.family: root.fontFamily
+                      wrapMode: Text.Wrap
+                    }
+                    Button {
+                      id: drestore
+                      text: "Restore"
+                      onClicked: root.restore(rec.id)
+                    }
+                  }
+
+                  Text {
+                    visible: !!rec.command
+                    width: parent.width
+                    text: rec.command || ""
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.Wrap
+                    elide: Text.ElideRight
+                  }
+
+                  Text {
+                    visible: !!rec.dismissed_at
+                    text: "dismissed " + (rec.dismissed_at || "").slice(0, 10)
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -618,6 +894,9 @@ Panel {
       scanning = false
       root.refreshState()
       root.refreshRecs()
+      root.refreshHistory()
+      root.refreshDiscarded()
+      root.reconcileNow()
       if (exitCode !== 0) root.state = Object.assign({}, root.state, { status: "error" })
     }
   }
@@ -648,6 +927,7 @@ Panel {
       root.applyFinished = true
       root.refreshState()
       root.refreshRecs()
+      root.refreshHistory()
       root.selected = ({})
       root.selectedCount = 0
     }
@@ -655,13 +935,49 @@ Panel {
   Process {
     id: dismissProc
     command: ["omarchy-optimize-state"]
-    onExited: function() { root.refreshState(); root.refreshRecs() }
+    onExited: function() { root.refreshState(); root.refreshRecs(); root.refreshDiscarded() }
+  }
+  Process {
+    id: historyProc
+    command: ["omarchy-optimize-state", "history"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: { try { root.history = JSON.parse(text) } catch (e) { root.history = [] } }
+    }
+  }
+  Process {
+    id: discardedProc
+    command: ["omarchy-optimize-state", "list-dismissed"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: { try { root.discarded = JSON.parse(text) } catch (e) { root.discarded = [] } }
+    }
+  }
+  Process {
+    id: retryProc
+    command: ["omarchy-optimize-state"]
+    onExited: function() { root.refreshState(); root.refreshRecs(); root.refreshHistory(); root.refreshDiscarded() }
+  }
+  Process {
+    id: restoreProc
+    command: ["omarchy-optimize-state"]
+    onExited: function() { root.refreshRecs(); root.refreshDiscarded() }
+  }
+  Process {
+    id: clearHistoryProc
+    command: ["omarchy-optimize-state", "clear-history"]
+    onExited: function() { root.refreshHistory() }
+  }
+  Process {
+    id: reconcileProc
+    command: ["omarchy-optimize-state", "reconcile"]
+    onExited: function() { root.refreshState(); root.refreshRecs(); root.refreshHistory() }
   }
 
   // ----- refresh cadence ---------------------------------------------------
   // A timer with running:true fires on instantiation regardless of visible,
   // so the widget discovers pending recommendations even while hidden and
   // flips visible on when there is something to show.
-  Timer { interval: 30000; running: true; repeat: true; triggeredOnStart: true; onTriggered: { root.refreshState(); root.refreshRecs() } }
-  Component.onCompleted: { root.refreshState(); root.refreshRecs() }
+  Timer { interval: 30000; running: true; repeat: true; triggeredOnStart: true; onTriggered: { root.refreshState(); root.refreshRecs(); root.refreshHistory(); root.refreshDiscarded() } }
+  Component.onCompleted: { root.refreshState(); root.refreshRecs(); root.refreshHistory(); root.refreshDiscarded(); root.reconcileNow() }
 }

@@ -142,17 +142,40 @@ if ! run_agent_headless "$PROMPT" > "$RAW" 2>&1; then
   exit 1
 fi
 
-# 4. Extract a JSON object/array from the reply, then drop dismissed ids.
+# 4. Extract a JSON object/array from the reply, then drop dismissed/applied ids.
 DISMISSED="$STATE_DIR/dismissed.json"
-python3 - "$RAW" "$RECS_OUT" "$DISMISSED" <<'PY'
+HISTORY="$STATE_DIR/history.json"
+python3 - "$RAW" "$RECS_OUT" "$DISMISSED" "$HISTORY" <<'PY'
 import json, re, sys, os
 raw = open(sys.argv[1]).read()
 dismissed_path = sys.argv[3]
-# Load persistent blocklist of dismissed ids.
-try:
-    dismissed = {d["id"] for d in json.load(open(dismissed_path)) if isinstance(d, dict) and "id" in d}
-except (FileNotFoundError, json.JSONDecodeError):
-    dismissed = set()
+history_path = sys.argv[4]
+
+def rec_key(r):
+    action = (r.get("action") or "command")
+    if action == "uninstall":
+        pkg = (r.get("command") or r.get("path") or "").strip()
+        return ("uninstall:" + pkg) if pkg else "uninstall:"
+    if action in ("delete", "archive", "cloud"):
+        p = (r.get("command") or r.get("path") or "").strip()
+        return (action + ":" + p) if p else (action + ":")
+    cmd = (r.get("command") or "").strip()
+    if cmd:
+        return "command:" + cmd
+    return "suggest:" + (r.get("title") or r.get("id") or "").strip()
+
+def load(path):
+    try:
+        return json.load(open(path))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+dismissed = load(dismissed_path)
+history = load(history_path)
+dismissed_ids = {d["id"] for d in dismissed if isinstance(d, dict) and "id" in d}
+dismissed_keys = {d["key"] for d in dismissed if isinstance(d, dict) and "key" in d}
+history_ids = {h["id"] for h in history if isinstance(h, dict) and "id" in h}
+history_keys = {h["key"] for h in history if isinstance(h, dict) and "key" in h}
 recs = None
 # Try fenced ```json blocks first.
 for m in re.finditer(r"```(?:json)?\s*(\[.*?\]|\{.*?\})\s*```", raw, re.S):
@@ -171,13 +194,15 @@ if recs is None:
     try: recs = json.loads(raw).get("recommendations", [])
     except: recs = []
 if not isinstance(recs, list): recs = [recs]
-# Sanitize each entry against the schema, skipping dismissed ids.
+# Sanitize each entry against the schema, skipping dismissed/applied ids or keys.
 clean = []
 for r in recs:
     if not isinstance(r, dict): continue
     rid = str(r.get("id") or f"r{len(clean)+1}")
-    if rid in dismissed: continue
-    clean.append({
+    key = rec_key(r)
+    if rid in dismissed_ids or key in dismissed_keys or rid in history_ids or key in history_keys:
+        continue
+    entry = {
         "id": rid,
         "title": str(r.get("title","")),
         "rationale": str(r.get("rationale","")),
@@ -187,7 +212,15 @@ for r in recs:
         "command": str(r.get("command","")) if r.get("command") else "",
         "verify": str(r.get("verify","")) if r.get("verify") else "",
         "path": str(r.get("path","")) if r.get("path") else "",
-    })
+    }
+    if r.get("timeout") is not None:
+        try:
+            entry["timeout"] = int(r["timeout"])
+        except (ValueError, TypeError):
+            pass
+    if r.get("monitor"):
+        entry["monitor"] = str(r.get("monitor"))
+    clean.append(entry)
 json.dump(clean, open(sys.argv[2],"w"), indent=2)
 print(len(clean))
 PY

@@ -30,7 +30,7 @@
       { "key": "minSeverity", "type": "enum", "label": "Minimum severity shown", "options": ["low", "medium", "high"], "defaultValue": "low" },
       { "key": "cloudProvider", "type": "enum", "label": "Cloud upload handler", "options": ["none", "rclone", "local-send", "tailscale"], "defaultValue": "none", "description": "Handler invoked for recommendations with action=cloud." },
       { "key": "autoNotify", "type": "enum", "label": "Notify on new recommendations", "options": ["On", "Off"], "defaultValue": "On" },
-      { "key": "agent", "type": "enum", "label": "Analysis agent", "options": ["default", "claude", "codex", "opencode", "grok", "gemini", "copilot", "crush"], "defaultValue": "default", "description": "Agent used to analyze the snapshot. 'default' respects omarchy default agent." }
+      { "key": "agent", "type": "enum", "label": "Analysis agent", "options": ["default", "claude", "codex", "opencode", "grok", "gemini", "copilot", "crush"], "defaultValue": "default", "description": "Agent used to analyze the snapshot. 'default' respects the omarchy-default-agent setting." }
     ]
   }
 }

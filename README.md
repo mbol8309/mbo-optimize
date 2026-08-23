@@ -23,7 +23,9 @@ recommendations in a bar panel where you can pick which to act on.
 4. The **panel** lists each recommendation with a checkbox, severity, estimated
    savings, and the exact command the agent proposes. "Execute selected" runs
    the actions; cloud/uninstall/delete actions open a floating terminal so you
-   can type the sudo password.
+   can type the sudo password. Three tabs keep everything auditable:
+   **Pending** (to-do), **History** (what was run and how it ended), and
+   **Discarded** (recommendations you dismissed, restorable).
 5. A **systemd --user timer** re-runs the scan weekly and fires a desktop
    notification when new recommendations land.
 
@@ -40,8 +42,8 @@ mbo-optimize/
 ├── bin/
 │   ├── omarchy-optimize-collect    # df/du/pacman/journal → snapshot.json
 │   ├── omarchy-optimize-analyze    # omarchy agent prompt --inline → recommendations
-│   ├── omarchy-optimize-apply      # runs the selected actions
-│   └── omarchy-optimize-state      # read/write state.json, dismiss, reset
+│   ├── omarchy-optimize-apply      # runs the selected actions (timeout + verify)
+│   └── omarchy-optimize-state      # read/write state, dismiss/restore, history, reconcile
 ├── prompts/
 │   └── analyze.md         # prompt template fed to the agent (__SNAPSHOT__ replaced)
 ├── systemd/
@@ -54,7 +56,7 @@ mbo-optimize/
 ```
 
 State lives in `~/.local/state/omarchy/optimize/` (`snapshot.json`,
-`recommendations.json`, `state.json`).
+`recommendations.json`, `state.json`, `history.json`, `dismissed.json`).
 
 ## Install
 
@@ -89,7 +91,7 @@ Tunable via the widget's entry in `~/.config/omarchy/shell.json`, set with
 | `minSeverity` | `"low"` | Lowest severity shown in the panel |
 | `cloudProvider` | `"none"` | Handler for `action:cloud` (rclone / local-send / tailscale) |
 | `autoNotify` | `"On"` | Notify when new recommendations land |
-| `agent` | `"default"` | Informational; the agent used is `omarchy default agent` |
+| `agent` | `"default"` | Informational; the agent used is `omarchy-default-agent` |
 
 ## Uninstall
 
@@ -103,10 +105,33 @@ Tunable via the widget's entry in `~/.config/omarchy/shell.json`, set with
 ```bash
 omarchy-optimize-analyze                  # scan + analyze now
 omarchy-optimize-state read               # current status
-omarchy-optimize-state recommendations    # the recommendation list
+omarchy-optimize-state recommendations    # the pending recommendation list
+omarchy-optimize-state history            # applied items (with their outcome)
+omarchy-optimize-state list-dismissed     # discarded items
+omarchy-optimize-state reconcile          # prune recommendations already done
+omarchy-optimize-state retry <id>         # move a history item back to pending
+omarchy-optimize-state restore <id>       # un-discard an item
+omarchy-optimize-state clear-history      # empty history.json
 omarchy-optimize-apply apply '["downloads-iso"]'   # apply by id
 omarchy-shell mbo.optimize.open           # open the panel
 ```
+
+### Execution contract
+
+Every recommendation the agent produces carries how it should be run and
+checked. `apply` enforces this generically for **any** command — no action is
+special-cased:
+
+- `command` — the exact shell command to run.
+- `timeout` — hard cap in seconds (default 120). Nothing can hang forever.
+- `verify` — success check (exit 0 ⇒ ok); overrides the built-in per-action check.
+- `monitor` — optional liveness probe polled while `command` runs; a non-zero
+  result aborts the run as "stalled" instead of blocking the panel.
+
+After a run, every attempted item is moved out of Pending into **History** with
+its `ok` / `failed` / `partial` / `skipped` outcome, and `analyze` skips
+anything whose stable key (or id) is already in History or Discarded — so
+applied and dismissed items stay gone across rescans.
 
 ## Safety
 
